@@ -14,9 +14,11 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from simultaneous_interpreter.meeting_minutes import (  # noqa: E402
     MINUTES_MODEL,
     MeetingTurn,
+    OpenAICompatibleMeetingMinutesClient,
     QwenMeetingMinutesClient,
     build_chat_url,
     format_transcript,
+    normalize_chat_url,
     normalize_model_name,
     split_transcript,
 )
@@ -79,13 +81,60 @@ class TranscriptTests(unittest.TestCase):
 
     def test_normalize_model_name(self) -> None:
         self.assertEqual(normalize_model_name(" qwen-plus "), "qwen-plus")
+        self.assertEqual(normalize_model_name("Qwen/Qwen3-8B"), "Qwen/Qwen3-8B")
         with self.assertRaises(ValueError):
             normalize_model_name("")
         with self.assertRaises(ValueError):
             normalize_model_name("qwen plus")
 
+    def test_normalize_chat_url_accepts_base_or_full_url(self) -> None:
+        self.assertEqual(
+            normalize_chat_url("https://api.example.com/v1"),
+            "https://api.example.com/v1/chat/completions",
+        )
+        self.assertEqual(
+            normalize_chat_url("http://localhost:11434/v1/chat/completions"),
+            "http://localhost:11434/v1/chat/completions",
+        )
+        with self.assertRaises(ValueError):
+            normalize_chat_url("ftp://api.example.com/v1")
+
 
 class ClientTests(unittest.TestCase):
+    def test_openai_compatible_client_uses_custom_url_and_body(self) -> None:
+        captured = []
+
+        def fake_urlopen(request, timeout):
+            captured.append(request)
+            return FakeResponse(
+                {
+                    "choices": [{"message": {"content": "# 会议纪要\n自定义服务"}}],
+                    "usage": {},
+                }
+            )
+
+        client = OpenAICompatibleMeetingMinutesClient(
+            "",
+            "http://localhost:11434/v1",
+            model="qwen3:8b",
+            provider_name="本地模型",
+            extra_body={"stream": False},
+        )
+        started_at = sample_turns()[0].recorded_at
+        with patch("simultaneous_interpreter.meeting_minutes.urlopen", fake_urlopen):
+            client.generate(sample_turns(), started_at, started_at + timedelta(minutes=2))
+
+        request = captured[0]
+        self.assertEqual(
+            request.full_url,
+            "http://localhost:11434/v1/chat/completions",
+        )
+        self.assertIsNone(request.get_header("Authorization"))
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(payload["model"], "qwen3:8b")
+        self.assertFalse(payload["stream"])
+        self.assertNotIn("enable_thinking", payload)
+
     def test_generate_calls_configured_model_and_returns_usage(self) -> None:
         captured = []
 

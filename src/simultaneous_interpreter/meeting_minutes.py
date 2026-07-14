@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 
@@ -44,9 +45,20 @@ def normalize_model_name(model: str) -> str:
     normalized = model.strip()
     if not normalized:
         raise ValueError("会议纪要模型不能为空")
-    if not re.fullmatch(r"[A-Za-z0-9._:-]+", normalized):
-        raise ValueError("会议纪要模型只能包含字母、数字、点、下划线、冒号和连字符")
+    if not re.fullmatch(r"[A-Za-z0-9._:/-]+", normalized):
+        raise ValueError("会议纪要模型名称包含不支持的字符")
     return normalized
+
+
+def normalize_chat_url(api_url: str) -> str:
+    normalized = api_url.strip()
+    parts = urlsplit(normalized)
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        raise ValueError("Chat Completions 地址必须是有效的 http:// 或 https:// 地址")
+    path = parts.path.rstrip("/")
+    if not path.endswith("/chat/completions"):
+        path += "/chat/completions"
+    return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
 
 
 def format_transcript(turns: tuple[MeetingTurn, ...] | list[MeetingTurn]) -> str:
@@ -108,18 +120,27 @@ def _format_duration(started_at: datetime, ended_at: datetime) -> str:
     return f"{minutes}分{seconds}秒"
 
 
-class QwenMeetingMinutesClient:
+class OpenAICompatibleMeetingMinutesClient:
     def __init__(
         self,
         api_key: str,
-        workspace_id: str,
+        api_url: str,
         model: str = DEFAULT_MINUTES_MODEL,
+        *,
+        provider_name: str = "LLM",
+        extra_body: dict[str, Any] | None = None,
     ) -> None:
         self._api_key = api_key.strip()
-        if not self._api_key:
-            raise ValueError("API Key 不能为空")
-        self._url = build_chat_url(workspace_id)
+        self._url = normalize_chat_url(api_url)
         self._model = normalize_model_name(model)
+        self._provider_name = provider_name.strip() or "LLM"
+        self._extra_body = dict(extra_body or {})
+        reserved = {"model", "messages", "temperature", "max_tokens"}
+        conflicts = reserved.intersection(self._extra_body)
+        if conflicts:
+            raise ValueError(
+                "附加请求参数不能覆盖：" + "、".join(sorted(conflicts))
+            )
 
     def generate(
         self,
@@ -222,23 +243,21 @@ class QwenMeetingMinutesClient:
         ]
 
     def _chat(self, messages: list[dict[str, str]], max_tokens: int) -> MinutesResult:
-        payload = json.dumps(
-            {
-                "model": self._model,
-                "messages": messages,
-                "temperature": 0.2,
-                "max_tokens": max_tokens,
-                "enable_thinking": False,
-            },
-            ensure_ascii=False,
-        ).encode("utf-8")
+        body: dict[str, Any] = {
+            "model": self._model,
+            "messages": messages,
+            "temperature": 0.2,
+            "max_tokens": max_tokens,
+        }
+        body.update(self._extra_body)
+        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
         request = Request(
             self._url,
             data=payload,
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            },
+            headers=headers,
             method="POST",
         )
         try:
@@ -248,15 +267,19 @@ class QwenMeetingMinutesClient:
             detail = self._error_detail(exc.read())
             raise RuntimeError(f"纪要请求失败（HTTP {exc.code}）：{detail}") from exc
         except URLError as exc:
-            raise RuntimeError(f"无法连接千问会议纪要服务：{exc.reason}") from exc
+            raise RuntimeError(
+                f"无法连接{self._provider_name}会议纪要服务：{exc.reason}"
+            ) from exc
 
         try:
             data: dict[str, Any] = json.loads(body.decode("utf-8"))
             content = data["choices"][0]["message"]["content"].strip()
         except (KeyError, IndexError, TypeError, ValueError, UnicodeDecodeError) as exc:
-            raise RuntimeError("千问返回了无法解析的会议纪要响应") from exc
+            raise RuntimeError(
+                f"{self._provider_name}返回了无法解析的会议纪要响应"
+            ) from exc
         if not content:
-            raise RuntimeError("千问没有返回会议纪要内容")
+            raise RuntimeError(f"{self._provider_name}没有返回会议纪要内容")
         usage = data.get("usage") or {}
         return MinutesResult(
             markdown=content,
@@ -272,3 +295,21 @@ class QwenMeetingMinutesClient:
             return str(error.get("message") or data.get("message") or "服务拒绝请求")
         except (TypeError, ValueError, UnicodeDecodeError):
             return "服务拒绝请求"
+
+
+class QwenMeetingMinutesClient(OpenAICompatibleMeetingMinutesClient):
+    def __init__(
+        self,
+        api_key: str,
+        workspace_id: str,
+        model: str = DEFAULT_MINUTES_MODEL,
+    ) -> None:
+        if not api_key.strip():
+            raise ValueError("API Key 不能为空")
+        super().__init__(
+            api_key,
+            build_chat_url(workspace_id),
+            model,
+            provider_name="千问",
+            extra_body={"enable_thinking": False},
+        )

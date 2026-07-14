@@ -10,6 +10,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import numpy as np
 import websocket
@@ -76,13 +77,40 @@ UsageCallback = Callable[[UsageStats], None]
 MessageCallback = Callable[[str], None]
 
 
-def build_api_url(workspace_id: str) -> str:
+def normalize_realtime_model_name(model: str) -> str:
+    normalized = model.strip()
+    if not normalized:
+        raise ValueError("同传模型不能为空")
+    if not re.fullmatch(r"[A-Za-z0-9._:/-]+", normalized):
+        raise ValueError("同传模型名称包含不支持的字符")
+    return normalized
+
+
+def build_api_url(
+    workspace_id: str,
+    model: str = MODEL_NAME,
+    websocket_url: str = "",
+) -> str:
+    normalized_model = normalize_realtime_model_name(model)
+    custom_url = websocket_url.strip()
+    if custom_url:
+        if "{model}" in custom_url:
+            custom_url = custom_url.replace("{model}", quote(normalized_model, safe=""))
+        parts = urlsplit(custom_url)
+        if parts.scheme not in {"ws", "wss"} or not parts.netloc:
+            raise ValueError("同传 WebSocket 地址必须是有效的 ws:// 或 wss:// 地址")
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        query["model"] = normalized_model
+        return urlunsplit(
+            (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+        )
+
     normalized = workspace_id.strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]+", normalized):
         raise ValueError("WorkspaceId 只能包含字母、数字、下划线和连字符")
     return (
         f"wss://{normalized}.cn-beijing.maas.aliyuncs.com"
-        f"/api-ws/v1/realtime?model={MODEL_NAME}"
+        f"/api-ws/v1/realtime?model={quote(normalized_model, safe='')}"
     )
 
 
@@ -261,6 +289,8 @@ class QwenLiveTranslateClient:
         *,
         api_key: str,
         workspace_id: str,
+        model: str = MODEL_NAME,
+        websocket_url: str = "",
         source_language: str,
         target_language: str,
         audio_output: bool,
@@ -275,8 +305,10 @@ class QwenLiveTranslateClient:
     ) -> None:
         if audio_output and playback is None:
             raise ValueError("启用音频输出时必须提供播放设备")
-        self._api_key = api_key
-        self._api_url = build_api_url(workspace_id)
+        self._api_key = api_key.strip()
+        if not self._api_key:
+            raise ValueError("同传 API Key 不能为空")
+        self._api_url = build_api_url(workspace_id, model, websocket_url)
         self._source_language = source_language
         self._target_language = target_language
         self._audio_output = audio_output
@@ -554,6 +586,8 @@ class QwenInterpreterSession:
         *,
         api_key: str,
         workspace_id: str,
+        model: str = MODEL_NAME,
+        websocket_url: str = "",
         microphone: Any,
         teams_loopback: Any,
         virtual_output: Any,
@@ -571,6 +605,8 @@ class QwenInterpreterSession:
         self._outgoing = QwenLiveTranslateClient(
             api_key=api_key,
             workspace_id=workspace_id,
+            model=model,
+            websocket_url=websocket_url,
             source_language="zh",
             target_language="en",
             audio_output=True,
@@ -586,6 +622,8 @@ class QwenInterpreterSession:
         self._incoming = QwenLiveTranslateClient(
             api_key=api_key,
             workspace_id=workspace_id,
+            model=model,
+            websocket_url=websocket_url,
             source_language="en",
             target_language="zh",
             audio_output=False,

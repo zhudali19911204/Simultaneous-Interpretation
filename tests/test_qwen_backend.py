@@ -104,6 +104,18 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_api_url("bad.workspace/path")
 
+    def test_custom_api_url_uses_configured_model(self) -> None:
+        self.assertEqual(
+            build_api_url(
+                "",
+                "vendor/live-model",
+                "wss://gateway.example.com/realtime?tenant=demo&model=old",
+            ),
+            "wss://gateway.example.com/realtime?tenant=demo&model=vendor%2Flive-model",
+        )
+        with self.assertRaises(ValueError):
+            build_api_url("", MODEL_NAME, "https://gateway.example.com/realtime")
+
     def test_audio_session_configuration(self) -> None:
         client, *_ = make_client(audio_output=True)
         session = client.build_session_update()["session"]

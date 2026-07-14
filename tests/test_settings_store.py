@@ -10,6 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from simultaneous_interpreter.meeting_minutes import DEFAULT_MINUTES_MODEL  # noqa: E402
+from simultaneous_interpreter.provider_config import INTERPRETER_QWEN_COMPATIBLE  # noqa: E402
 from simultaneous_interpreter.settings_store import AppSettings, load_settings, save_settings  # noqa: E402
 
 
@@ -31,6 +32,32 @@ class SettingsStoreTests(unittest.TestCase):
             path.write_text('{"meeting_minutes_model": "bad model"}', encoding="utf-8")
             self.assertEqual(load_settings(path).meeting_minutes_model, DEFAULT_MINUTES_MODEL)
 
+    def test_round_trip_provider_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            expected = AppSettings(
+                interpreter_provider=INTERPRETER_QWEN_COMPATIBLE,
+                interpreter_model="vendor/live-translate",
+                interpreter_websocket_url="wss://gateway.example.com/realtime",
+                meeting_minutes_provider="deepseek",
+                meeting_minutes_model="deepseek-chat",
+                meeting_minutes_api_url="https://api.deepseek.com",
+                meeting_minutes_extra_body='{"stream": false}',
+            )
+            save_settings(expected, path)
+            actual = load_settings(path)
+            self.assertEqual(actual.interpreter_provider, expected.interpreter_provider)
+            self.assertEqual(actual.interpreter_model, expected.interpreter_model)
+            self.assertEqual(
+                actual.interpreter_websocket_url,
+                expected.interpreter_websocket_url,
+            )
+            self.assertEqual(actual.meeting_minutes_provider, "deepseek")
+            self.assertEqual(
+                actual.meeting_minutes_api_url,
+                "https://api.deepseek.com/chat/completions",
+            )
+            self.assertEqual(actual.meeting_minutes_extra_body, '{"stream": false}')
 
 if __name__ == "__main__":
     unittest.main()

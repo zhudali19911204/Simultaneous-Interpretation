@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 
 TARGET_NAME = "QwenTeamsInterpreter/DashScope"
+MINUTES_TARGET_NAME = "QwenTeamsInterpreter/MeetingMinutes"
 CRED_TYPE_GENERIC = 1
 CRED_PERSIST_LOCAL_MACHINE = 2
 ERROR_NOT_FOUND = 1168
@@ -63,35 +64,38 @@ def _credential_api() -> tuple[object, object, object, object]:
     return cred_write, cred_read, cred_delete, cred_free
 
 
-def save_credentials(api_key: str, workspace_id: str) -> None:
-    api_key = api_key.strip()
-    workspace_id = workspace_id.strip()
-    if not api_key or not workspace_id:
-        raise ValueError("API Key 和 WorkspaceId 均不能为空")
-
+def _save_credential(
+    target_name: str,
+    secret: str,
+    username: str,
+    comment: str,
+) -> None:
+    secret = secret.strip()
+    if not secret:
+        raise ValueError("API Key 不能为空")
     cred_write, _, _, _ = _credential_api()
-    blob = api_key.encode("utf-16-le")
+    blob = secret.encode("utf-16-le")
     blob_buffer = ctypes.create_string_buffer(blob)
     credential = _CredentialW(
         Type=CRED_TYPE_GENERIC,
-        TargetName=TARGET_NAME,
-        Comment="Teams 千问同声翻译助手",
+        TargetName=target_name,
+        Comment=comment,
         CredentialBlobSize=len(blob),
         CredentialBlob=ctypes.cast(
             blob_buffer, ctypes.POINTER(wintypes.BYTE)
         ),
         Persist=CRED_PERSIST_LOCAL_MACHINE,
-        UserName=workspace_id,
+        UserName=username.strip(),
     )
     if not cred_write(ctypes.byref(credential), 0):
         raise ctypes.WinError(ctypes.get_last_error())
 
 
-def load_credentials() -> SavedCredentials | None:
+def _load_credential(target_name: str) -> tuple[str, str] | None:
     _, cred_read, _, cred_free = _credential_api()
     pointer = ctypes.POINTER(_CredentialW)()
     if not cred_read(
-        TARGET_NAME,
+        target_name,
         CRED_TYPE_GENERIC,
         0,
         ctypes.byref(pointer),
@@ -107,17 +111,54 @@ def load_credentials() -> SavedCredentials | None:
             credential.CredentialBlob,
             credential.CredentialBlobSize,
         )
-        return SavedCredentials(
-            api_key=blob.decode("utf-16-le"),
-            workspace_id=credential.UserName or "",
-        )
+        return blob.decode("utf-16-le"), credential.UserName or ""
     finally:
         cred_free(ctypes.cast(pointer, ctypes.c_void_p))
 
 
-def clear_credentials() -> None:
+def _delete_credential(target_name: str) -> None:
     _, _, cred_delete, _ = _credential_api()
-    if not cred_delete(TARGET_NAME, CRED_TYPE_GENERIC, 0):
+    if not cred_delete(target_name, CRED_TYPE_GENERIC, 0):
         error = ctypes.get_last_error()
         if error != ERROR_NOT_FOUND:
             raise ctypes.WinError(error)
+
+
+def save_credentials(api_key: str, workspace_id: str) -> None:
+    _save_credential(
+        TARGET_NAME,
+        api_key,
+        workspace_id,
+        "Teams 同声翻译服务",
+    )
+
+
+def load_credentials() -> SavedCredentials | None:
+    value = _load_credential(TARGET_NAME)
+    if value is None:
+        return None
+    api_key, workspace_id = value
+    return SavedCredentials(api_key=api_key, workspace_id=workspace_id)
+
+
+def save_minutes_api_key(api_key: str) -> None:
+    _save_credential(
+        MINUTES_TARGET_NAME,
+        api_key,
+        "meeting-minutes",
+        "AI 会议纪要服务",
+    )
+
+
+def load_minutes_api_key() -> str:
+    value = _load_credential(MINUTES_TARGET_NAME)
+    return value[0] if value else ""
+
+
+def clear_minutes_api_key() -> None:
+    _delete_credential(MINUTES_TARGET_NAME)
+
+
+def clear_credentials() -> None:
+    _delete_credential(TARGET_NAME)
+    _delete_credential(MINUTES_TARGET_NAME)
