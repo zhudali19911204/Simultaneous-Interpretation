@@ -91,6 +91,14 @@ $env:MINUTES_MODEL = "你的会议纪要模型"
 
 音频路由面板首次启动时展开；同传连接成功后会自动收起，为双字幕区域留出更多空间，随时可点击“展开音频路由”重新打开。如果安装或切换了虚拟声卡，请点击“刷新音频设备”，也可按 `F5`。
 
+## PPT 演示字幕
+
+演示 PowerPoint 时，点击主窗口的“显示演示字幕”（快捷键 `Ctrl+Shift+S`），屏幕底部会出现置顶的中英双语字幕条：中文固定在上、英文固定在下。字幕条保留最近 3 组结果，新内容自动滚动到底部；当前未完成句会实时替换并在长时间无更新时清除，最终结果会持续保留，直到被后续结果从最近 3 组中自然滚出。
+
+- 按住字幕条可拖动到其他位置或显示器；滚轮可查看最近内容，双击字幕条可隐藏。
+- 字幕条是独立窗口。希望 Teams 参会者看到字幕时，请共享**整个屏幕**；只共享 PowerPoint 窗口通常不会包含字幕层。
+- 放映前建议先共享屏幕、显示字幕条，再说一句测试语句确认字体大小和位置。
+
 ## AI 会议纪要
 
 1. 正常开始同传，应用会在内存中记录双方的最终字幕和时间。
@@ -138,12 +146,22 @@ LiveTranslate 的“省流量静音门控”默认开启：
 
 当前官方规则中，模型输入音频约为每秒7 Token，输出音频约为每秒12.5 Token。实际账单仍以百炼控制台为准，建议同时设置费用告警。
 
+## 自动重连与诊断
+
+同传成功启动后，如果某一个翻译方向因网络抖动或服务端临时关闭而断开，应用会保留另一个方向并在后台自动重连。重试间隔依次为 2、5、10、20、30 秒，之后每 30 秒继续尝试；两个方向共享连接频率限制，避免重连风暴。
+
+- 主窗口会显示具体方向和重试次数，PPT 字幕条也会显示简短提示；恢复后提示自动消失。
+- 已完成字幕、Token 统计和会议纪要素材会保留。断线期间未送达服务端的音频不会补传，正在处理的半句可能丢失。
+- API Key、模型或权限配置无效时不会持续重试，请修正设置后重新开始。
+- 连接诊断日志位于 `%APPDATA%\SimultaneousInterpreter\logs\interpreter.log`，单文件最大 1 MB并保留 3 份。日志不记录凭据、WorkspaceId、音频、字幕或会议内容。
+
 ## 当前行为
 
 - 中译英会话输出文本和英文音频；英译中会话只输出文本，避免不需要的中文音频费用。
 - 输入为 16 kHz、16 bit、单声道 PCM；英文输出为 24 kHz、16 bit、单声道 PCM。
 - 中间译文用于实时预览，最终译文写入历史区域。
 - 停止时会发送结束报文，等待最后一段翻译完成后再关闭连接。
+- 心跳超时为20秒；运行中异常断开会按方向独立自动恢复。
 
 ## 已知限制
 
@@ -161,6 +179,17 @@ LiveTranslate 的“省流量静音门控”默认开启：
 .\.venv\Scripts\python.exe -m pip check
 ```
 
+## 打包 Windows 发行版
+
+安装构建依赖并生成 Windows x64 独立发行包：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+.\build_release.ps1
+```
+
+输出位于 `release\TeamsInterpreter-Windows-x64-<提交号>.zip`。同事无需安装 Python：完整解压后可直接运行 `app\TeamsInterpreter.exe`，或双击 `Install.cmd` 安装到当前 Windows 用户目录并创建快捷方式。应用安装不需要管理员权限；VB-CABLE 等虚拟声卡驱动仍需另行安装，通常需要管理员权限。
+
 ## 项目结构
 
 ```text
@@ -168,13 +197,19 @@ src/main.py
 src/simultaneous_interpreter/app.py            # Tkinter 桌面界面
 src/simultaneous_interpreter/audio_devices.py  # WASAPI 设备枚举
 src/simultaneous_interpreter/credential_store.py # Windows 凭据管理器
+src/simultaneous_interpreter/diagnostics.py    # 脱敏滚动连接日志
 src/simultaneous_interpreter/meeting_minutes.py # AI 会议纪要
 src/simultaneous_interpreter/provider_config.py # 供应商预设与配置解析
 src/simultaneous_interpreter/qwen_backend.py   # 千问双 WebSocket 会话
 src/simultaneous_interpreter/settings_store.py # 本机非敏感设置
 src/simultaneous_interpreter/ui_theme.py       # 午夜科技蓝主题与 Markdown 展示解析
+src/simultaneous_interpreter/subtitle_overlay.py # PPT 中英双语置顶字幕层
+TeamsInterpreter.spec                          # PyInstaller 打包配置
+build_release.ps1                              # Windows x64 发行包构建脚本
+packaging/                                     # 当前用户安装脚本与发行说明
 tests/test_meeting_minutes.py                  # 纪要格式、分段与接口测试
 tests/test_provider_config.py                  # 供应商配置测试
 tests/test_qwen_backend.py                     # 配置、事件与用量测试
 tests/test_ui_theme.py                         # 状态样式与 Markdown 展示解析测试
+tests/test_subtitle_overlay.py                  # 中英字幕顺序与文本压缩测试
 ```

@@ -9,3 +9,6 @@ __pycache__/
 tools/
 config.json
 *.log
+/build/
+/dist/
+/release/

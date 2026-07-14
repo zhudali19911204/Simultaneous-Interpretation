@@ -19,6 +19,7 @@ from .credential_store import (
     save_credentials,
     save_minutes_api_key,
 )
+from .diagnostics import ConnectionDiagnosticLogger
 from .meeting_minutes import (
     DEFAULT_MINUTES_MODEL,
     MeetingTurn,
@@ -39,6 +40,7 @@ from .provider_config import (
     resolve_minutes_url,
 )
 from .qwen_backend import (
+    ConnectionStatus,
     QwenInterpreterSession,
     TranslationEvent,
     UsageStats,
@@ -46,6 +48,7 @@ from .qwen_backend import (
     normalize_realtime_model_name,
 )
 from .settings_store import AppSettings, load_settings, save_settings
+from .subtitle_overlay import SubtitleOverlay
 from . import ui_theme as ui
 
 
@@ -94,6 +97,14 @@ class InterpreterApp:
         self._events: queue.Queue[UiMessage] = queue.Queue()
         self._session: QwenInterpreterSession | None = None
         self._state = "idle"
+        self._connection_states: dict[str, ConnectionStatus] = {}
+        self._had_connection_interruption = False
+        try:
+            self._diagnostic_logger: ConnectionDiagnosticLogger | None = (
+                ConnectionDiagnosticLogger()
+            )
+        except OSError:
+            self._diagnostic_logger = None
         self._catalog = AudioDeviceCatalog()
         self._choice_maps: dict[str, dict[str, AudioDeviceChoice]] = {}
         self._meeting_turns: list[MeetingTurn] = []
@@ -160,13 +171,23 @@ class InterpreterApp:
         self.always_on_top_var = tk.BooleanVar(value=False)
         self.silence_gate_var = tk.BooleanVar(value=True)
         self.audio_toggle_var = tk.StringVar(value="收起音频路由")
+        self.presentation_button_var = tk.StringVar(value="显示演示字幕")
         self.show_api_key_var = tk.BooleanVar(value=False)
         self.show_minutes_api_key_var = tk.BooleanVar(value=False)
 
         self._configure_style()
+        self._subtitle_overlay = SubtitleOverlay(
+            self.root,
+            self._fonts,
+            self._on_overlay_hidden,
+        )
         self._build_ui()
         self._refresh_devices(show_errors=False)
         self.root.bind("<Control-comma>", lambda _event: self._open_settings())
+        self.root.bind(
+            "<Control-Shift-S>",
+            self._toggle_presentation_subtitles,
+        )
         self.root.bind("<F5>", self._on_refresh_shortcut)
         self.root.bind("<Configure>", self._on_root_configure, add="+")
         self.root.after(self.POLL_MS, self._drain_events)
@@ -349,6 +370,12 @@ class InterpreterApp:
             state="disabled",
         )
         self.test_button.pack(side="left", padx=(ui.SPACE_2, 0))
+        self.presentation_button = ttk.Button(
+            primary_actions,
+            textvariable=self.presentation_button_var,
+            command=self._toggle_presentation_subtitles,
+        )
+        self.presentation_button.pack(side="left", padx=(ui.SPACE_2, 0))
 
         preferences = ttk.Frame(controls, style="Background.TFrame")
         preferences.grid(row=0, column=2, sticky="e")
@@ -453,6 +480,7 @@ class InterpreterApp:
             card,
             textvariable=interim_var,
             style="Interim.TLabel",
+            width=1,
             wraplength=480,
             justify="left",
         )
@@ -499,7 +527,7 @@ class InterpreterApp:
             for row in (0, 1):
                 self.panes.rowconfigure(row, weight=0)
             for column in (0, 1):
-                self.panes.columnconfigure(column, weight=0)
+                self.panes.columnconfigure(column, weight=0, uniform="")
             if mode == "wide":
                 for card in (self.incoming_card, self.outgoing_card):
                     card.configure(padding=ui.SPACE_4)
@@ -510,8 +538,16 @@ class InterpreterApp:
                     interim.pack_configure(
                         pady=(ui.SPACE_3, ui.SPACE_3)
                     )
-                self.panes.columnconfigure(0, weight=1)
-                self.panes.columnconfigure(1, weight=1)
+                self.panes.columnconfigure(
+                    0,
+                    weight=1,
+                    uniform="transcript",
+                )
+                self.panes.columnconfigure(
+                    1,
+                    weight=1,
+                    uniform="transcript",
+                )
                 self.panes.rowconfigure(0, weight=1)
                 self.incoming_card.grid(
                     row=0,
@@ -1381,6 +1417,9 @@ class InterpreterApp:
             return
 
         self._state = "starting"
+        self._connection_states.clear()
+        self._had_connection_interruption = False
+        self._subtitle_overlay.clear_connection_notice()
         provider_label = INTERPRETER_BY_ID[interpreter_provider].label
         self._set_status(f"正在连接{provider_label}…", "busy", busy=True)
         self.usage_var.set("Token：0")
@@ -1394,6 +1433,10 @@ class InterpreterApp:
             "on_outgoing": lambda event: self._post("outgoing", event),
             "on_usage": lambda usage: self._post("usage", usage),
             "on_error": lambda message: self._post("error", message),
+            "on_connection_status": lambda status: self._post(
+                "connection_status", status
+            ),
+            "on_diagnostic": self._log_connection_status,
             "use_silence_gate": self.silence_gate_var.get(),
         }
         self._session = QwenInterpreterSession(
@@ -1417,6 +1460,7 @@ class InterpreterApp:
         if self._state not in {"running", "starting"}:
             return
         self._state = "stopping"
+        self._subtitle_overlay.clear_connection_notice()
         self._set_status("正在停止…", "busy", busy=True)
         self.stop_button.configure(state="disabled")
         self.test_button.configure(state="disabled")
@@ -1509,6 +1553,10 @@ class InterpreterApp:
     def _post(self, kind: str, payload: Any = None) -> None:
         self._events.put(UiMessage(kind, payload))
 
+    def _log_connection_status(self, status: ConnectionStatus) -> None:
+        if self._diagnostic_logger:
+            self._diagnostic_logger.log(status)
+
     def _drain_events(self) -> None:
         try:
             while True:
@@ -1526,6 +1574,7 @@ class InterpreterApp:
                 self._meeting_started_at = datetime.now()
             self._meeting_ended_at = None
             self._set_status("同传运行中", "running", busy=False)
+            self._subtitle_overlay.clear_connection_notice()
             self._set_audio_panel_expanded(False)
             self.stop_button.configure(state="normal")
             self.test_button.configure(state="normal")
@@ -1533,6 +1582,7 @@ class InterpreterApp:
             self._state = "idle"
             self._session = None
             self._set_status("启动失败", "error", busy=False)
+            self._subtitle_overlay.clear_connection_notice()
             self._set_controls_running(False)
             messagebox.showerror("启动失败", str(message.payload))
         elif message.kind == "stopped":
@@ -1540,10 +1590,20 @@ class InterpreterApp:
             self._session = None
             self._meeting_ended_at = datetime.now()
             self._set_status("已停止", "idle", busy=False)
+            self._connection_states.clear()
+            self._had_connection_interruption = False
+            self._subtitle_overlay.clear_connection_notice()
             self._set_controls_running(False)
             self.incoming_interim_var.set("等待对方说英文…")
             self.outgoing_interim_var.set("等待你说中文…")
         elif message.kind == "incoming":
+            event: TranslationEvent = message.payload
+            self._subtitle_overlay.update_translation(
+                "incoming",
+                event.source_text,
+                event.translated_text,
+                event.is_final,
+            )
             self._record_turn("incoming", message.payload)
             self._show_translation(
                 message.payload,
@@ -1551,6 +1611,13 @@ class InterpreterApp:
                 self.incoming_history,
             )
         elif message.kind == "outgoing":
+            event = message.payload
+            self._subtitle_overlay.update_translation(
+                "outgoing",
+                event.source_text,
+                event.translated_text,
+                event.is_final,
+            )
             self._record_turn("outgoing", message.payload)
             self._show_translation(
                 message.payload,
@@ -1559,6 +1626,8 @@ class InterpreterApp:
             )
         elif message.kind == "error":
             self._set_status(str(message.payload), "error")
+        elif message.kind == "connection_status":
+            self._handle_connection_status(message.payload)
         elif message.kind == "usage":
             usage: UsageStats = message.payload
             self.usage_var.set(
@@ -1585,6 +1654,78 @@ class InterpreterApp:
             self.clear_history_button.configure(state="normal")
             self._update_minutes_button()
             messagebox.showerror("会议纪要生成失败", str(message.payload))
+
+    def _handle_connection_status(self, status: ConnectionStatus) -> None:
+        if status.direction not in {"incoming", "outgoing"}:
+            return
+        self._connection_states[status.direction] = status
+        if status.state in {"reconnecting", "failed"}:
+            self._had_connection_interruption = True
+
+        outgoing = self._connection_states.get("outgoing")
+        if self._state == "running" and hasattr(self, "test_button"):
+            self.test_button.configure(
+                state=(
+                    "normal"
+                    if outgoing and outgoing.state == "connected"
+                    else "disabled"
+                )
+            )
+        if self._state != "running":
+            return
+
+        labels = {"outgoing": "中译英", "incoming": "英译中"}
+        failed = next(
+            (
+                item
+                for item in self._connection_states.values()
+                if item.state == "failed"
+            ),
+            None,
+        )
+        if failed:
+            label = labels[failed.direction]
+            detail = failed.detail or "不可恢复的连接错误"
+            if len(detail) > 80:
+                detail = detail[:79] + "…"
+            self._set_status(f"{label}已停止：{detail}", "error", busy=False)
+            self._subtitle_overlay.set_connection_notice(
+                f"{label}连接失败，请检查设置",
+                kind="error",
+            )
+            return
+
+        reconnecting = next(
+            (
+                item
+                for item in self._connection_states.values()
+                if item.state == "reconnecting"
+            ),
+            None,
+        )
+        if reconnecting:
+            label = labels[reconnecting.direction]
+            text = f"{label}重连中（第 {reconnecting.attempt} 次）…"
+            self._set_status(text, "warning", busy=True)
+            self._subtitle_overlay.set_connection_notice(text, kind="warning")
+            return
+
+        both_connected = all(
+            self._connection_states.get(direction)
+            and self._connection_states[direction].state == "connected"
+            for direction in ("outgoing", "incoming")
+        )
+        if both_connected:
+            self._set_status("同传运行中", "running", busy=False)
+            if self._had_connection_interruption:
+                self._subtitle_overlay.set_connection_notice(
+                    "连接已恢复",
+                    kind="info",
+                    clear_after_ms=3_000,
+                )
+                self._had_connection_interruption = False
+            else:
+                self._subtitle_overlay.clear_connection_notice()
 
     def _record_turn(self, direction: str, event: TranslationEvent) -> None:
         if not event.is_final or not (event.source_text or event.translated_text):
@@ -1655,6 +1796,17 @@ class InterpreterApp:
     def _toggle_topmost(self) -> None:
         self.root.attributes("-topmost", self.always_on_top_var.get())
 
+    def _toggle_presentation_subtitles(self, _event: object = None) -> None:
+        if self._subtitle_overlay.visible:
+            self._subtitle_overlay.hide()
+            self._on_overlay_hidden()
+        else:
+            self._subtitle_overlay.show()
+            self.presentation_button_var.set("隐藏演示字幕")
+
+    def _on_overlay_hidden(self) -> None:
+        self.presentation_button_var.set("显示演示字幕")
+
     def _clear_history(self) -> None:
         if self._meeting_turns and not messagebox.askyesno(
             "清空会议记录",
@@ -1666,6 +1818,7 @@ class InterpreterApp:
         self._meeting_turns.clear()
         self._meeting_started_at = None
         self._meeting_ended_at = None
+        self._subtitle_overlay.reset()
         self._update_minutes_button()
 
     def _show_minutes_window(self, markdown: str) -> None:
@@ -1838,10 +1991,13 @@ class InterpreterApp:
         self._set_status("会议纪要已保存", "info")
 
     def _on_close(self) -> None:
+        self._subtitle_overlay.destroy()
         if self._state in {"running", "starting"} and self._session:
             self._set_status("正在关闭…", "busy", busy=True)
             try:
                 self._session.stop()
             except Exception:
                 pass
+        if self._diagnostic_logger:
+            self._diagnostic_logger.close()
         self.root.destroy()

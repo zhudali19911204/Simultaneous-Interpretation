@@ -15,6 +15,8 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 import numpy as np
 import websocket
 
+from .diagnostics import sanitize_diagnostic
+
 
 INPUT_SAMPLE_RATE = 16_000
 OUTPUT_SAMPLE_RATE = 24_000
@@ -26,6 +28,12 @@ GATE_PRE_ROLL_BLOCKS = 8  # 160 ms
 # Keep sending silence slightly beyond the typical server VAD boundary. Stopping
 # exactly at the boundary can delay finalization until the next speech segment.
 GATE_HANGOVER_BLOCKS = 50  # 1000 ms
+PING_INTERVAL_SECONDS = 30
+PING_TIMEOUT_SECONDS = 20
+INITIAL_CONNECTION_TIMEOUT_SECONDS = 15.0
+RECONNECT_DELAYS_SECONDS = (2.0, 5.0, 10.0, 20.0, 30.0)
+MAX_CONNECTION_ATTEMPTS_PER_WINDOW = 8
+CONNECTION_ATTEMPT_WINDOW_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -33,6 +41,14 @@ class TranslationEvent:
     source_text: str
     translated_text: str
     is_final: bool
+
+
+@dataclass(frozen=True)
+class ConnectionStatus:
+    direction: str
+    state: str
+    attempt: int = 0
+    detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -75,6 +91,51 @@ class UsageStats:
 TranslationCallback = Callable[[TranslationEvent], None]
 UsageCallback = Callable[[UsageStats], None]
 MessageCallback = Callable[[str], None]
+ConnectionStatusCallback = Callable[[ConnectionStatus], None]
+
+
+def reconnect_delay(attempt: int) -> float:
+    if attempt < 1:
+        return 0.0
+    index = min(attempt, len(RECONNECT_DELAYS_SECONDS)) - 1
+    return RECONNECT_DELAYS_SECONDS[index]
+
+
+class ConnectionAttemptLimiter:
+    def __init__(
+        self,
+        max_attempts: int = MAX_CONNECTION_ATTEMPTS_PER_WINDOW,
+        window_seconds: float = CONNECTION_ATTEMPT_WINDOW_SECONDS,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if max_attempts < 1 or window_seconds <= 0:
+            raise ValueError("连接限速参数必须大于 0")
+        self._max_attempts = max_attempts
+        self._window_seconds = window_seconds
+        self._clock = clock
+        self._attempts: deque[float] = deque()
+        self._lock = threading.Lock()
+
+    def reserve_delay(self) -> float:
+        with self._lock:
+            now = self._clock()
+            cutoff = now - self._window_seconds
+            while self._attempts and self._attempts[0] <= cutoff:
+                self._attempts.popleft()
+            if len(self._attempts) < self._max_attempts:
+                self._attempts.append(now)
+                return 0.0
+            return max(0.0, self._attempts[0] + self._window_seconds - now)
+
+    def wait_for_slot(self, stop_event: threading.Event) -> bool:
+        while not stop_event.is_set():
+            delay = self.reserve_delay()
+            if delay <= 0:
+                return True
+            if stop_event.wait(delay):
+                return False
+        return False
 
 
 def normalize_realtime_model_name(model: str) -> str:
@@ -300,6 +361,10 @@ class QwenLiveTranslateClient:
         on_translation: TranslationCallback,
         on_usage: UsageCallback,
         on_error: MessageCallback,
+        on_connection_status: ConnectionStatusCallback | None = None,
+        on_diagnostic: ConnectionStatusCallback | None = None,
+        attempt_limiter: ConnectionAttemptLimiter | None = None,
+        direction: str,
         name: str,
         use_silence_gate: bool,
     ) -> None:
@@ -308,6 +373,7 @@ class QwenLiveTranslateClient:
         self._api_key = api_key.strip()
         if not self._api_key:
             raise ValueError("同传 API Key 不能为空")
+        self._workspace_id = workspace_id.strip()
         self._api_url = build_api_url(workspace_id, model, websocket_url)
         self._source_language = source_language
         self._target_language = target_language
@@ -317,6 +383,10 @@ class QwenLiveTranslateClient:
         self._on_translation = on_translation
         self._on_usage = on_usage
         self._on_error = on_error
+        self._on_connection_status = on_connection_status or (lambda _status: None)
+        self._on_diagnostic = on_diagnostic or (lambda _status: None)
+        self._attempt_limiter = attempt_limiter or ConnectionAttemptLimiter()
+        self._direction = direction
         self._name = name
         self._capture = PcmCaptureWorker(
             input_device=input_device,
@@ -329,19 +399,28 @@ class QwenLiveTranslateClient:
         self._thread: threading.Thread | None = None
         self._connection_ready = threading.Event()
         self._session_finished = threading.Event()
+        self._stop_event = threading.Event()
         self._send_lock = threading.Lock()
         self._socket_open = False
         self._configured = False
         self._capture_started = False
         self._stopping = False
+        self._ever_connected = False
         self._startup_error = ""
         self._event_sequence = 0
+        self._generation = 0
+        self._current_attempt = 0
+        self._last_transport_error = ""
+        self._close_status_code: int | None = None
+        self._close_message = ""
+        self._retryable_close = True
         self._latest_source = ""
         self._pending_sources: deque[str] = deque()
         self._finished_translations: set[str] = set()
 
     def start(self) -> None:
         self._connection_ready.clear()
+        self._stop_event.clear()
         self._session_finished.clear()
         self._pending_sources.clear()
         self._finished_translations.clear()
@@ -351,31 +430,28 @@ class QwenLiveTranslateClient:
         self._socket_open = False
         self._configured = False
         self._capture_started = False
+        self._ever_connected = False
         self._startup_error = ""
-        self._ws = websocket.WebSocketApp(
-            self._api_url,
-            header=[f"Authorization: Bearer {self._api_key}"],
-            on_open=self._on_open,
-            on_message=self._on_message,
-            on_error=self._on_socket_error,
-            on_close=self._on_close,
-        )
         self._thread = threading.Thread(
-            target=self._run_socket,
-            name=f"qwen-{self._name}-websocket",
+            target=self._connection_loop,
+            name=f"qwen-{self._name}-supervisor",
             daemon=True,
         )
         self._thread.start()
-        if not self._connection_ready.wait(timeout=15.0):
+        if not self._connection_ready.wait(
+            timeout=INITIAL_CONNECTION_TIMEOUT_SECONDS
+        ):
+            self._startup_error = f"连接千问{self._name}会话超时"
             self.stop()
-            raise RuntimeError(f"连接千问{self._name}会话超时")
-        if not self._configured:
+            raise RuntimeError(self._startup_error)
+        if not self._ever_connected:
             error = self._startup_error or f"千问{self._name}会话配置失败"
             self.stop()
             raise RuntimeError(error)
 
     def stop(self) -> None:
         self._stopping = True
+        self._stop_event.set()
         self._capture.stop()
         if self._configured and self._socket_open:
             try:
@@ -388,15 +464,90 @@ class QwenLiveTranslateClient:
                 self._session_finished.wait(timeout=8.0)
             except Exception:
                 pass
-        if self._ws:
+        ws = self._ws
+        if ws:
             try:
-                self._ws.close()
+                ws.close()
             except Exception:
                 pass
-        if self._thread and self._thread.is_alive():
+        if (
+            self._thread
+            and self._thread.is_alive()
+            and self._thread is not threading.current_thread()
+        ):
             self._thread.join(timeout=2.0)
         self._socket_open = False
         self._configured = False
+
+    def _connection_loop(self) -> None:
+        attempt = 0
+        failure_detail = ""
+        while not self._stop_event.is_set():
+            if attempt:
+                self._emit_status(
+                    "reconnecting",
+                    attempt=attempt,
+                    detail=failure_detail,
+                )
+                if self._stop_event.wait(reconnect_delay(attempt)):
+                    break
+            if not self._attempt_limiter.wait_for_slot(self._stop_event):
+                break
+
+            self._prepare_connection(attempt)
+            if attempt == 0:
+                self._emit_status("connecting")
+            try:
+                self._run_socket()
+            except Exception as exc:
+                self._last_transport_error = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+            finally:
+                self._capture.stop()
+
+            if self._stop_event.is_set() or self._stopping:
+                break
+            failure_detail = self._failure_detail()
+            if not self._ever_connected:
+                self._startup_error = failure_detail or f"千问{self._name}连接失败"
+                self._emit_status("failed", detail=self._startup_error)
+                self._connection_ready.set()
+                break
+            if not self._retryable_close:
+                self._emit_status("failed", detail=failure_detail)
+                break
+            attempt += 1
+
+    def _prepare_connection(self, attempt: int) -> None:
+        self._session_finished.clear()
+        self._pending_sources.clear()
+        self._finished_translations.clear()
+        self._latest_source = ""
+        self._socket_open = False
+        self._configured = False
+        self._capture_started = False
+        self._last_transport_error = ""
+        self._close_status_code = None
+        self._close_message = ""
+        self._retryable_close = True
+        self._current_attempt = attempt
+        self._generation += 1
+        generation = self._generation
+        self._ws = websocket.WebSocketApp(
+            self._api_url,
+            header=[f"Authorization: Bearer {self._api_key}"],
+            on_open=lambda ws: self._on_open(generation, ws),
+            on_message=lambda ws, message: self._on_message(
+                generation, ws, message
+            ),
+            on_error=lambda ws, error: self._on_socket_error(
+                generation, ws, error
+            ),
+            on_close=lambda ws, code, message: self._on_close(
+                generation, ws, code, message
+            ),
+        )
 
     def build_session_update(self) -> dict[str, Any]:
         session: dict[str, Any] = {
@@ -423,20 +574,33 @@ class QwenLiveTranslateClient:
     def _run_socket(self) -> None:
         assert self._ws is not None
         self._ws.run_forever(
-            ping_interval=20,
-            ping_timeout=10,
+            ping_interval=PING_INTERVAL_SECONDS,
+            ping_timeout=PING_TIMEOUT_SECONDS,
             sockopt=((socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),),
         )
 
-    def _on_open(self, _: websocket.WebSocketApp) -> None:
+    def _on_open(
+        self,
+        generation: int,
+        _: websocket.WebSocketApp,
+    ) -> None:
+        if generation != self._generation or self._stopping:
+            return
         self._socket_open = True
         try:
             self._send_json(self.build_session_update())
         except Exception as exc:
             self._startup_error = f"发送千问会话配置失败：{exc}"
-            self._connection_ready.set()
+            self._signal_transport_failure(self._startup_error)
 
-    def _on_message(self, _: websocket.WebSocketApp, message: str) -> None:
+    def _on_message(
+        self,
+        generation: int,
+        _: websocket.WebSocketApp,
+        message: str,
+    ) -> None:
+        if generation != self._generation:
+            return
         try:
             self._handle_message(message)
         except Exception as exc:
@@ -451,18 +615,24 @@ class QwenLiveTranslateClient:
             error = event.get("error") or {}
             code = error.get("code", event.get("code", "unknown"))
             detail = error.get("message", event.get("message", "未知错误"))
-            self._startup_error = f"千问错误 {code}：{detail}"
-            self._connection_ready.set()
+            self._retryable_close = self._is_retryable_server_error(code)
+            self._last_transport_error = f"服务错误 {code}：{detail}"
+            if not self._ever_connected:
+                self._startup_error = self._last_transport_error
             self._capture.request_stop()
-            self._on_error(self._startup_error)
+            ws = self._ws
+            if ws:
+                ws.close()
             return
 
         if event_type == "session.updated":
             self._configured = True
+            self._ever_connected = True
             self._connection_ready.set()
             if not self._capture_started:
                 self._capture_started = True
                 self._capture.start()
+            self._emit_status("connected", attempt=self._current_attempt)
             return
 
         if event_type == "session.finished":
@@ -537,13 +707,18 @@ class QwenLiveTranslateClient:
     def _send_audio(self, pcm: bytes) -> None:
         if not self._configured:
             return
-        self._send_json(
-            {
-                "event_id": self._next_event_id(),
-                "type": "input_audio_buffer.append",
-                "audio": base64.b64encode(pcm).decode("ascii"),
-            }
-        )
+        try:
+            self._send_json(
+                {
+                    "event_id": self._next_event_id(),
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(pcm).decode("ascii"),
+                }
+            )
+        except Exception as exc:
+            self._signal_transport_failure(
+                f"发送音频失败：{type(exc).__name__}: {exc}"
+            )
 
     def _send_json(self, event: dict[str, Any]) -> None:
         with self._send_lock:
@@ -555,29 +730,95 @@ class QwenLiveTranslateClient:
         self._event_sequence += 1
         return f"event_{self._name}_{int(time.time() * 1000)}_{self._event_sequence}"
 
-    def _on_socket_error(self, _: websocket.WebSocketApp, error: Any) -> None:
-        self._startup_error = f"千问{self._name}连接错误：{error}"
-        self._connection_ready.set()
+    def _on_socket_error(
+        self,
+        generation: int,
+        _: websocket.WebSocketApp,
+        error: Any,
+    ) -> None:
+        if generation != self._generation or self._stopping:
+            return
+        self._last_transport_error = f"{type(error).__name__}: {error}"
+        if not self._ever_connected:
+            self._startup_error = self._last_transport_error
         self._capture.request_stop()
-        if not self._stopping:
-            self._on_error(self._startup_error)
 
     def _on_close(
         self,
+        generation: int,
         _: websocket.WebSocketApp,
         close_status_code: int | None,
         close_message: str | None,
     ) -> None:
-        was_open = self._socket_open
+        if generation != self._generation:
+            return
         self._socket_open = False
+        self._configured = False
+        self._close_status_code = close_status_code
+        self._close_message = close_message or ""
         self._session_finished.set()
-        self._connection_ready.set()
         self._capture.request_stop()
-        if was_open and not self._stopping:
-            detail = close_message or str(close_status_code or "")
-            self._on_error(
-                f"千问{self._name}连接已断开：{detail}".rstrip("：")
-            )
+
+    def _signal_transport_failure(self, detail: str) -> None:
+        if self._stopping:
+            return
+        self._last_transport_error = detail
+        self._retryable_close = True
+        self._configured = False
+        self._capture.request_stop()
+        ws = self._ws
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def _failure_detail(self) -> str:
+        parts: list[str] = []
+        if self._last_transport_error:
+            parts.append(self._last_transport_error)
+        if self._close_status_code is not None:
+            parts.append(f"关闭码 {self._close_status_code}")
+        if self._close_message:
+            parts.append(self._close_message)
+        if not parts:
+            parts.append("连接无关闭码断开")
+        return "；".join(dict.fromkeys(parts))
+
+    @staticmethod
+    def _is_retryable_server_error(code: object) -> bool:
+        normalized = str(code or "").strip().lower()
+        if normalized in {"401", "403"}:
+            return False
+        fatal_markers = (
+            "auth",
+            "permission",
+            "forbidden",
+            "invalid",
+            "unsupported",
+            "not_found",
+        )
+        return not any(marker in normalized for marker in fatal_markers)
+
+    def _emit_status(
+        self,
+        state: str,
+        *,
+        attempt: int = 0,
+        detail: str = "",
+    ) -> None:
+        safe_detail = sanitize_diagnostic(
+            detail,
+            (self._api_key, self._workspace_id, self._api_url),
+        )
+        status = ConnectionStatus(
+            direction=self._direction,
+            state=state,
+            attempt=attempt,
+            detail=safe_detail,
+        )
+        self._on_diagnostic(status)
+        self._on_connection_status(status)
 
 
 class QwenInterpreterSession:
@@ -596,11 +837,14 @@ class QwenInterpreterSession:
         on_outgoing: TranslationCallback,
         on_usage: UsageCallback,
         on_error: MessageCallback,
+        on_connection_status: ConnectionStatusCallback | None = None,
+        on_diagnostic: ConnectionStatusCallback | None = None,
         use_silence_gate: bool,
     ) -> None:
         self._on_usage = on_usage
         self._usage = UsageStats()
         self._usage_lock = threading.Lock()
+        attempt_limiter = ConnectionAttemptLimiter()
         self._playback = PcmPlaybackWorker(virtual_output, on_error)
         self._outgoing = QwenLiveTranslateClient(
             api_key=api_key,
@@ -616,6 +860,10 @@ class QwenInterpreterSession:
             on_translation=on_outgoing,
             on_usage=self._add_usage,
             on_error=on_error,
+            on_connection_status=on_connection_status,
+            on_diagnostic=on_diagnostic,
+            attempt_limiter=attempt_limiter,
+            direction="outgoing",
             name="中译英",
             use_silence_gate=use_silence_gate,
         )
@@ -631,6 +879,10 @@ class QwenInterpreterSession:
             on_translation=on_incoming,
             on_usage=self._add_usage,
             on_error=on_error,
+            on_connection_status=on_connection_status,
+            on_diagnostic=on_diagnostic,
+            attempt_limiter=attempt_limiter,
+            direction="incoming",
             name="英译中",
             use_silence_gate=use_silence_gate,
         )
