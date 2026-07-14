@@ -47,11 +47,13 @@ Teams 对方英文
 
 ## 配置模型供应商
 
-启动应用后，点击主窗口右上角的 **⚙ 齿轮按钮**打开“模型供应商设置”。设置窗口分为两套独立配置，主窗口平时只显示音频路由和字幕：
+启动应用后，点击主窗口右上角的 **设置** 按钮打开“模型供应商设置”（也可按 `Ctrl+,`）。设置窗口分为“同声翻译”和“AI 会议纪要”两个标签页，主窗口保持以实时字幕为主：
 
-- **同传供应商**：默认“阿里云百炼 LiveTranslate”。选择“自定义 LiveTranslate 兼容接口”后，可填写完整的 `ws://` 或 `wss://` 地址。
+- **同传供应商**：默认“阿里云百炼 LiveTranslate”。只有选择“自定义 LiveTranslate 兼容接口”后，才会显示 `ws://` 或 `wss://` 地址字段。
 - **会议纪要 LLM**：选择供应商、模型和 Chat Completions 地址。供应商预设只负责填入常用地址，地址仍可手动修改。
 - **附加请求参数 JSON**：用于供应商特有参数，例如 `{"top_p": 0.8}`。不能覆盖 `model`、`messages`、`temperature` 和 `max_tokens`。
+
+两个 API Key 字段都可临时切换显示/隐藏；保存校验失败时，错误会直接显示在设置窗口中，并定位到需要修正的字段。按 `Escape` 可取消设置。
 
 同传实时音频协议没有行业统一标准。“自定义 LiveTranslate 兼容接口”必须兼容本项目当前使用的千问 LiveTranslate WebSocket 事件格式；普通 OpenAI Chat Completions 地址只能用于会议纪要，不能直接用于同传。其他实时协议需要新增对应的适配器。
 
@@ -87,14 +89,14 @@ $env:MINUTES_MODEL = "你的会议纪要模型"
 4. 点击“开始同传”，再点击“测试输出声道”。另一台加入 Teams 的设备应听到短促测试音。
 5. 正式会议前，用另一台设备检查英文音量、延迟和回声。
 
-如果安装或切换了虚拟声卡，请点击“刷新音频设备”。
+音频路由面板首次启动时展开；同传连接成功后会自动收起，为双字幕区域留出更多空间，随时可点击“展开音频路由”重新打开。如果安装或切换了虚拟声卡，请点击“刷新音频设备”，也可按 `F5`。
 
 ## AI 会议纪要
 
 1. 正常开始同传，应用会在内存中记录双方的最终字幕和时间。
 2. 会议结束后点击“停止”。
 3. 点击窗口底部的“生成 AI 会议纪要”。
-4. 纪要窗口支持一键复制，或保存为 UTF-8 编码的 Markdown 文件。
+4. 纪要窗口会显示会议起止时间，并按标题、列表和正文样式展示；可一键复制原始 Markdown，或保存为 UTF-8 编码的 Markdown 文件。
 
 “会议纪要模型”默认是 `qwen3.5-flash`。切换供应商后，请填写该供应商实际开放的模型名称；模型可用性和费用以对应供应商控制台为准。本地 Ollama 可以不填 API Key。
 
@@ -170,7 +172,9 @@ src/simultaneous_interpreter/meeting_minutes.py # AI 会议纪要
 src/simultaneous_interpreter/provider_config.py # 供应商预设与配置解析
 src/simultaneous_interpreter/qwen_backend.py   # 千问双 WebSocket 会话
 src/simultaneous_interpreter/settings_store.py # 本机非敏感设置
+src/simultaneous_interpreter/ui_theme.py       # 午夜科技蓝主题与 Markdown 展示解析
 tests/test_meeting_minutes.py                  # 纪要格式、分段与接口测试
 tests/test_provider_config.py                  # 供应商配置测试
 tests/test_qwen_backend.py                     # 配置、事件与用量测试
+tests/test_ui_theme.py                         # 状态样式与 Markdown 展示解析测试
 ```
