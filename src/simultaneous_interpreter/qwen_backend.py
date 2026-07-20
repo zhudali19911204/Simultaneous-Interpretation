@@ -36,6 +36,32 @@ MAX_CONNECTION_ATTEMPTS_PER_WINDOW = 8
 CONNECTION_ATTEMPT_WINDOW_SECONDS = 60.0
 ALIGNMENT_TIMEOUT_SECONDS = 5.0
 
+_DNS_FAILURE_MARKERS = (
+    "getaddrinfo",
+    "websocketaddressexception",
+    "gaierror",
+    "name or service not known",
+    "nodename nor servname",
+    "errno 11001",
+    "errno 11002",
+)
+_TRANSIENT_STARTUP_MARKERS = (
+    *_DNS_FAILURE_MARKERS,
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "connection reset",
+    "connection refused",
+    "remote host was lost",
+    "status code 429",
+    "status code 500",
+    "status code 502",
+    "status code 503",
+    "status code 504",
+    "rate_limit",
+    "internal_error",
+)
+
 
 @dataclass(frozen=True)
 class TranslationEvent:
@@ -420,6 +446,31 @@ def reconnect_delay(attempt: int) -> float:
     return RECONNECT_DELAYS_SECONDS[index]
 
 
+def is_retryable_startup_failure(
+    detail: str,
+    close_status_code: int | None,
+    transport_retryable: bool,
+) -> bool:
+    if not transport_retryable:
+        return False
+    normalized = detail.casefold()
+    if any(marker in normalized for marker in _TRANSIENT_STARTUP_MARKERS):
+        return True
+    return close_status_code in {None, 1006}
+
+
+def format_startup_failure(detail: str, retry_count: int) -> str:
+    normalized = detail.casefold()
+    retry_text = f"，已自动重试 {retry_count} 次" if retry_count else ""
+    if any(marker in normalized for marker in _DNS_FAILURE_MARKERS):
+        return (
+            f"无法解析实时翻译服务域名（DNS）{retry_text}。"
+            "请确认 WorkspaceId 属于华北2（北京），并检查当前网络、VPN、代理或公司 DNS；"
+            f"也可切换手机热点验证。\n\n技术信息：{detail}"
+        )
+    return detail
+
+
 class ConnectionAttemptLimiter:
     def __init__(
         self,
@@ -758,11 +809,26 @@ class QwenLiveTranslateClient:
         if not self._connection_ready.wait(
             timeout=INITIAL_CONNECTION_TIMEOUT_SECONDS
         ):
-            self._startup_error = f"连接千问{self._name}会话超时"
+            detail = self._startup_error or f"连接千问{self._name}会话超时"
+            safe_detail = sanitize_diagnostic(
+                detail,
+                (self._api_key, self._workspace_id, self._api_url),
+            )
+            error = format_startup_failure(safe_detail, self._current_attempt)
+            self._emit_status(
+                "failed",
+                attempt=self._current_attempt,
+                detail=error,
+            )
             self.stop()
-            raise RuntimeError(self._startup_error)
+            raise RuntimeError(error)
         if not self._ever_connected:
-            error = self._startup_error or f"千问{self._name}会话配置失败"
+            detail = self._startup_error or f"千问{self._name}会话配置失败"
+            safe_detail = sanitize_diagnostic(
+                detail,
+                (self._api_key, self._workspace_id, self._api_url),
+            )
+            error = format_startup_failure(safe_detail, self._current_attempt)
             self.stop()
             raise RuntimeError(error)
 
@@ -832,6 +898,13 @@ class QwenLiveTranslateClient:
             failure_detail = self._failure_detail()
             if not self._ever_connected:
                 self._startup_error = failure_detail or f"千问{self._name}连接失败"
+                if is_retryable_startup_failure(
+                    failure_detail,
+                    self._close_status_code,
+                    self._retryable_close,
+                ):
+                    attempt += 1
+                    continue
                 self._emit_status("failed", detail=self._startup_error)
                 self._connection_ready.set()
                 break

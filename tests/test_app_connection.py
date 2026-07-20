@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +46,34 @@ def make_app_shell():
 
 
 class AppConnectionStatusTests(unittest.TestCase):
+    def test_meeting_assistant_is_created_only_when_opened(self) -> None:
+        app = InterpreterApp.__new__(InterpreterApp)
+        app._meeting_assistant = None
+        app.root = object()
+        app._fonts = object()
+        app._meeting_turns = []
+        app._create_meeting_assistant_client = lambda: None
+
+        class FakeAssistantWindow:
+            instances = 0
+            shows = 0
+
+            def __init__(self, *_args):
+                type(self).instances += 1
+
+            def show(self):
+                type(self).shows += 1
+
+        with patch(
+            "simultaneous_interpreter.app.MeetingAssistantWindow",
+            FakeAssistantWindow,
+        ):
+            app._show_meeting_assistant()
+            app._show_meeting_assistant()
+
+        self.assertEqual(FakeAssistantWindow.instances, 1)
+        self.assertEqual(FakeAssistantWindow.shows, 2)
+
     def test_reconnecting_direction_recovers_without_clearing_meeting(self) -> None:
         app, status_calls = make_app_shell()
         app._handle_connection_status(

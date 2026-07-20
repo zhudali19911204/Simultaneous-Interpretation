@@ -5,6 +5,7 @@
 - 同传使用千问 LiveTranslate 或兼容接口：对方说英文时显示中文字幕，你说中文时输出英文译文和合成语音。
 - 同传供应商、实时模型、WebSocket 地址和 API Key 都可在界面中配置。
 - 会议纪要支持百炼、DeepSeek、Moonshot/Kimi、智谱、硅基流动、OpenAI、本地 Ollama，以及任意 OpenAI Chat Completions 兼容服务。
+- 独立会议助手可查看完整时间线、基于会议记录问答，并按需整理实时重点。
 - 同传与会议纪要可以使用不同供应商和不同 API Key；百炼纪要可以复用已保存的百炼同传 Key。
 - 音频默认不录制、不落盘；实时音频会发送到你选择的同传服务处理。
 
@@ -114,6 +115,16 @@ $env:MINUTES_MODEL = "你的会议纪要模型"
 
 > 当前音频链路只能区分“我”和“对方”，不能可靠识别多位参会者。只有会议内容明确提到姓名、负责人或截止时间时，纪要才会使用这些信息；其余内容标记为“未明确”。
 
+## AI 会议理解助手
+
+点击主窗口底部的“会议助手”打开独立窗口。助手只读取当前内存中已经配对完成的最终字幕，不修改同传连接、PPT 字幕或会议纪要记录：
+
+- **完整时间线**：按时间查看“我/对方”记录，支持角色筛选、关键词高亮和复制，全程不调用网络。
+- **会中问答**：输入问题后，助手使用当前重点、最近 15 分钟内容和相关历史记录回答；回答需附 `[时间 我/对方]` 依据，没有可核验依据时会明确拒绝猜测。
+- **实时重点**：手动点击“刷新重点”后整理当前议题、结论、行动项、风险和未决问题。自动更新默认关闭；主动开启后，每 5 分钟且至少新增 300 个字符时才调用模型。
+
+问答与实时重点复用“AI 会议纪要”标签页中的供应商、模型、API Key 和附加参数，但不会保存或改写配置。助手 Token 独立统计，网络错误仅显示在助手窗口，不影响同传运行。关闭助手会停止自动刷新；内容只保存在当前应用内存中，“清空记录”会同步清空助手状态。
+
 ## 省流量模式
 
 LiveTranslate 的“省流量静音门控”默认开启：
@@ -148,11 +159,12 @@ LiveTranslate 的“省流量静音门控”默认开启：
 
 ## 自动重连与诊断
 
-同传成功启动后，如果某一个翻译方向因网络抖动或服务端临时关闭而断开，应用会保留另一个方向并在后台自动重连。重试间隔依次为 2、5、10、20、30 秒，之后每 30 秒继续尝试；两个方向共享连接频率限制，避免重连风暴。
+首次启动遇到 DNS、连接超时、`429` 或临时服务端错误时，应用会在 15 秒启动窗口内先自动重试，不再因一次短暂的 `getaddrinfo` 失败立即退出。同传成功启动后，如果某一个翻译方向因网络抖动或服务端临时关闭而断开，应用会保留另一个方向并在后台自动重连。重试间隔依次为 2、5、10、20、30 秒，之后每 30 秒继续尝试；两个方向共享连接频率限制，避免重连风暴。
 
 - 主窗口会显示具体方向和重试次数，PPT 字幕条也会显示简短提示；恢复后提示自动消失。
 - 已完成字幕、Token 统计和会议纪要素材会保留。断线期间未送达服务端的音频不会补传，正在处理的半句可能丢失。
 - API Key、模型或权限配置无效时不会持续重试，请修正设置后重新开始。
+- DNS 持续失败时，错误窗口会明确提示检查北京地域 WorkspaceId、VPN、代理、公司 DNS 或切换手机热点；这类错误发生在请求到达模型服务之前。
 - 连接诊断日志位于 `%APPDATA%\SimultaneousInterpreter\logs\interpreter.log`，单文件最大 1 MB并保留 3 份。日志不记录凭据、WorkspaceId、音频、字幕或会议内容。
 
 ## 当前行为
@@ -170,6 +182,7 @@ LiveTranslate 的“省流量静音门控”默认开启：
 - 使用扬声器外放可能让实体麦克风收到对方声音；优先使用耳机。
 - 两个翻译方向会占用两条实时 WebSocket 会话，需满足所选同传供应商的并发限制。
 - 生成会议纪要会额外调用一次或多次你选择的文本模型并产生相应 Token 费用。
+- 会议助手的问答、手动重点和主动开启的自动重点会额外调用会议纪要模型；仅查看时间线不会产生 LLM 费用。
 - 测试和正式会议前应告知参会者音频将由第三方云服务处理，并遵守组织的数据与隐私要求。
 
 ## 测试
@@ -178,6 +191,21 @@ LiveTranslate 的“省流量静音门控”默认开启：
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 .\.venv\Scripts\python.exe -m pip check
 ```
+
+## 安装 Windows 发布版
+
+收到 `TeamsInterpreter-Windows-x64-<版本>.zip` 后，推荐按以下方式安装：
+
+1. 右键 ZIP 文件并选择“全部解压”。不要直接在压缩包预览窗口中运行程序。
+2. 打开解压后的目录，双击 `Install.cmd`。
+3. 程序会安装到当前用户的 `%LOCALAPPDATA%\TeamsInterpreter`，并创建桌面和开始菜单快捷方式，不需要管理员权限。
+4. 从桌面启动 `Teams Interpreter`，检查已保存的 API Key、WorkspaceId、模型和音频设备，然后点击“开始同传”。
+
+如需免安装运行，完整解压后直接打开 `app` 文件夹并双击 `TeamsInterpreter.exe`。覆盖安装新版本不会主动删除当前 Windows 用户已保存的凭据和配置。
+
+如果 Windows SmartScreen 显示“未知发布者”，可确认安装包来源及随包 SHA256 校验文件后，点击“更多信息”→“仍要运行”。这是因为当前内部版本没有代码签名证书。
+
+应用本身无需管理员权限。若要把合成英文语音发送到 Teams，仍需单独安装 VB-CABLE 或兼容虚拟声卡；驱动安装通常需要管理员权限，已安装的设备无需重复安装。
 
 ## 打包 Windows 发行版
 
@@ -188,7 +216,7 @@ LiveTranslate 的“省流量静音门控”默认开启：
 .\build_release.ps1
 ```
 
-输出位于 `release\TeamsInterpreter-Windows-x64-<提交号>.zip`。同事无需安装 Python：完整解压后可直接运行 `app\TeamsInterpreter.exe`，或双击 `Install.cmd` 安装到当前 Windows 用户目录并创建快捷方式。应用安装不需要管理员权限；VB-CABLE 等虚拟声卡驱动仍需另行安装，通常需要管理员权限。
+输出位于 `release\TeamsInterpreter-Windows-x64-<提交号>.zip`。发布包同时包含 `Install.cmd`、免安装程序、用户指南、构建信息和 SHA256 校验文件；同事无需安装 Python。
 
 ## 项目结构
 
@@ -199,6 +227,8 @@ src/simultaneous_interpreter/audio_devices.py  # WASAPI 设备枚举
 src/simultaneous_interpreter/credential_store.py # Windows 凭据管理器
 src/simultaneous_interpreter/diagnostics.py    # 脱敏滚动连接日志
 src/simultaneous_interpreter/meeting_minutes.py # AI 会议纪要
+src/simultaneous_interpreter/meeting_assistant.py # 会议问答、检索与增量重点逻辑
+src/simultaneous_interpreter/meeting_assistant_window.py # 独立会议助手窗口
 src/simultaneous_interpreter/provider_config.py # 供应商预设与配置解析
 src/simultaneous_interpreter/qwen_backend.py   # 千问双 WebSocket 会话
 src/simultaneous_interpreter/settings_store.py # 本机非敏感设置
@@ -208,6 +238,7 @@ TeamsInterpreter.spec                          # PyInstaller 打包配置
 build_release.ps1                              # Windows x64 发行包构建脚本
 packaging/                                     # 当前用户安装脚本与发行说明
 tests/test_meeting_minutes.py                  # 纪要格式、分段与接口测试
+tests/test_meeting_assistant.py                # 时间线、问答、重点与隔离测试
 tests/test_provider_config.py                  # 供应商配置测试
 tests/test_qwen_backend.py                     # 配置、事件与用量测试
 tests/test_ui_theme.py                         # 状态样式与 Markdown 展示解析测试

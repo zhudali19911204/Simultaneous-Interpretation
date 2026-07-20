@@ -27,6 +27,8 @@ from .meeting_minutes import (
     OpenAICompatibleMeetingMinutesClient,
     normalize_model_name,
 )
+from .meeting_assistant import MeetingAssistantClient
+from .meeting_assistant_window import MeetingAssistantWindow
 from .provider_config import (
     INTERPRETER_BY_ID,
     INTERPRETER_BY_LABEL,
@@ -181,6 +183,7 @@ class InterpreterApp:
             self._fonts,
             self._on_overlay_hidden,
         )
+        self._meeting_assistant: MeetingAssistantWindow | None = None
         self._build_ui()
         self._refresh_devices(show_errors=False)
         self.root.bind("<Control-comma>", lambda _event: self._open_settings())
@@ -448,6 +451,12 @@ class InterpreterApp:
             state="disabled",
         )
         self.minutes_button.pack(side="right", padx=(0, ui.SPACE_2))
+        self.meeting_assistant_button = ttk.Button(
+            footer_actions,
+            text="会议助手",
+            command=self._show_meeting_assistant,
+        )
+        self.meeting_assistant_button.pack(side="right", padx=(0, ui.SPACE_2))
 
         self._reset_history(self.incoming_history)
         self._reset_history(self.outgoing_history)
@@ -1482,6 +1491,36 @@ class InterpreterApp:
             self._session.test_output()
             self._set_status("已向英文输出设备发送测试音", "info")
 
+    def _create_meeting_assistant_client(self) -> MeetingAssistantClient:
+        provider_id = self._minutes_provider_id()
+        api_key = self._resolved_minutes_api_key(provider_id)
+        model = normalize_model_name(self.minutes_model_var.get())
+        api_url = resolve_minutes_url(
+            provider_id,
+            self.workspace_id_var.get().strip(),
+            self.minutes_api_url_var.get(),
+        )
+        extra_body = parse_extra_body(self.minutes_extra_body_var.get())
+        if provider_id == LLM_QWEN_WORKSPACE:
+            extra_body.setdefault("enable_thinking", False)
+        return MeetingAssistantClient(
+            api_key,
+            api_url,
+            model,
+            provider_name=LLM_BY_ID[provider_id].label,
+            extra_body=extra_body,
+        )
+
+    def _show_meeting_assistant(self) -> None:
+        if self._meeting_assistant is None:
+            self._meeting_assistant = MeetingAssistantWindow(
+                self.root,
+                self._fonts,
+                lambda: tuple(self._meeting_turns),
+                self._create_meeting_assistant_client,
+            )
+        self._meeting_assistant.show()
+
     def _generate_minutes(self) -> None:
         if self._state != "idle" or self._minutes_generating:
             return
@@ -2003,6 +2042,8 @@ class InterpreterApp:
         self._set_status("会议纪要已保存", "info")
 
     def _on_close(self) -> None:
+        if self._meeting_assistant is not None:
+            self._meeting_assistant.destroy()
         self._subtitle_overlay.destroy()
         if self._state in {"running", "starting"} and self._session:
             self._set_status("正在关闭…", "busy", busy=True)

@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import websocket
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
@@ -28,6 +30,8 @@ from simultaneous_interpreter.qwen_backend import (  # noqa: E402
     TranslationAligner,
     UsageStats,
     build_api_url,
+    format_startup_failure,
+    is_retryable_startup_failure,
     reconnect_delay,
 )
 
@@ -217,8 +221,134 @@ class ConfigurationTests(unittest.TestCase):
             )
         )
 
+    def test_startup_failure_classifies_dns_and_fatal_configuration(self) -> None:
+        self.assertTrue(
+            is_retryable_startup_failure(
+                "WebSocketAddressException: [Errno 11002] getaddrinfo failed",
+                None,
+                True,
+            )
+        )
+        self.assertFalse(
+            is_retryable_startup_failure(
+                "服务错误 invalid_value：bad model",
+                1008,
+                False,
+            )
+        )
+        message = format_startup_failure(
+            "WebSocketAddressException: getaddrinfo failed",
+            2,
+        )
+        self.assertIn("DNS", message)
+        self.assertIn("自动重试 2 次", message)
+
 
 class ReconnectionTests(unittest.TestCase):
+    def test_initial_dns_failure_retries_and_then_connects(self) -> None:
+        statuses = []
+        release = threading.Event()
+
+        class DnsThenConnectedWebSocket:
+            instances = 0
+
+            def __init__(self, _url, **callbacks):
+                self.index = type(self).instances
+                type(self).instances += 1
+                self.callbacks = callbacks
+                self.closed = False
+
+            def send(self, payload):
+                event = json.loads(payload)
+                if event.get("type") == "session.finish":
+                    self.callbacks["on_message"](
+                        self,
+                        json.dumps({"type": "session.finished"}),
+                    )
+
+            def close(self):
+                if not self.closed:
+                    self.closed = True
+                    self.callbacks["on_close"](self, 1000, "")
+                    release.set()
+
+            def run_forever(self, **_options):
+                if self.index == 0:
+                    self.callbacks["on_error"](
+                        self,
+                        websocket.WebSocketAddressException(
+                            "[Errno 11002] getaddrinfo failed"
+                        ),
+                    )
+                    self.callbacks["on_close"](self, None, None)
+                    return
+                self.callbacks["on_open"](self)
+                self.callbacks["on_message"](
+                    self,
+                    json.dumps({"type": "session.updated"}),
+                )
+                release.wait(2.0)
+
+        client, *_ = make_client(statuses=statuses)
+        client._capture = FakeCapture()  # type: ignore[assignment]
+        with patch(
+            "simultaneous_interpreter.qwen_backend.websocket.WebSocketApp",
+            DnsThenConnectedWebSocket,
+        ), patch(
+            "simultaneous_interpreter.qwen_backend.reconnect_delay",
+            return_value=0.01,
+        ):
+            client.start()
+            client.stop()
+
+        self.assertEqual(DnsThenConnectedWebSocket.instances, 2)
+        self.assertIn("reconnecting", [status.state for status in statuses])
+        self.assertIn("connected", [status.state for status in statuses])
+
+    def test_persistent_initial_dns_failure_reports_actionable_error(self) -> None:
+        statuses = []
+
+        class DnsFailureWebSocket:
+            instances = 0
+
+            def __init__(self, _url, **callbacks):
+                type(self).instances += 1
+                self.callbacks = callbacks
+
+            def send(self, _payload):
+                return None
+
+            def close(self):
+                return None
+
+            def run_forever(self, **_options):
+                self.callbacks["on_error"](
+                    self,
+                    websocket.WebSocketAddressException(
+                        "[Errno 11002] getaddrinfo failed"
+                    ),
+                )
+                self.callbacks["on_close"](self, None, None)
+
+        client, *_ = make_client(statuses=statuses)
+        client._capture = FakeCapture()  # type: ignore[assignment]
+        with patch(
+            "simultaneous_interpreter.qwen_backend.websocket.WebSocketApp",
+            DnsFailureWebSocket,
+        ), patch(
+            "simultaneous_interpreter.qwen_backend.reconnect_delay",
+            return_value=0.01,
+        ), patch(
+            "simultaneous_interpreter.qwen_backend.INITIAL_CONNECTION_TIMEOUT_SECONDS",
+            0.06,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "DNS"):
+                client.start()
+
+        self.assertGreater(DnsFailureWebSocket.instances, 1)
+        self.assertEqual(statuses[-1].state, "failed")
+        self.assertIn("手机热点", statuses[-1].detail)
+
     def test_disconnect_reconnects_once_and_restarts_capture(self) -> None:
         statuses = []
         diagnostics = []
