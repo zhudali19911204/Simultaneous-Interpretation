@@ -181,6 +181,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(payload["model"], "qwen-max")
         self.assertFalse(payload["enable_thinking"])
         self.assertIn("行动项", payload["messages"][1]["content"])
+        self.assertNotIn("shared_screen_context", payload["messages"][1]["content"])
 
     def test_generate_uses_default_minutes_model(self) -> None:
         captured = []
@@ -201,6 +202,32 @@ class ClientTests(unittest.TestCase):
 
         payload = json.loads(captured[0].data.decode("utf-8"))
         self.assertEqual(payload["model"], MINUTES_MODEL)
+
+    def test_visual_context_adds_shared_screen_section_only_when_present(self) -> None:
+        captured = []
+
+        def fake_urlopen(request, timeout):
+            captured.append(request)
+            return FakeResponse(
+                {
+                    "choices": [{"message": {"content": "# 会议纪要\n视觉内容"}}],
+                    "usage": {},
+                }
+            )
+
+        client = QwenMeetingMinutesClient("sk-test", "ws-test")
+        started_at = sample_turns()[0].recorded_at
+        with patch("simultaneous_interpreter.meeting_minutes.urlopen", fake_urlopen):
+            client.generate(
+                sample_turns(),
+                started_at,
+                started_at + timedelta(minutes=1),
+                "[画面 09:30:00 第1页]\n标题：项目计划",
+            )
+
+        prompt = json.loads(captured[0].data.decode("utf-8"))["messages"][1]["content"]
+        self.assertIn("## 共享画面要点", prompt)
+        self.assertIn("<shared_screen_context>", prompt)
 
     def test_long_meeting_aggregates_chunk_and_final_usage(self) -> None:
         responses = iter(

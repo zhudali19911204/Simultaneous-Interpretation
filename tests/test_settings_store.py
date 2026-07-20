@@ -43,6 +43,11 @@ class SettingsStoreTests(unittest.TestCase):
                 meeting_minutes_model="deepseek-chat",
                 meeting_minutes_api_url="https://api.deepseek.com",
                 meeting_minutes_extra_body='{"stream": false}',
+                visual_provider="openai",
+                visual_model="gpt-4.1-mini",
+                visual_api_url="https://api.openai.com/v1",
+                visual_extra_body='{"top_p": 0.8}',
+                visual_key_source="independent",
             )
             save_settings(expected, path)
             actual = load_settings(path)
@@ -58,6 +63,25 @@ class SettingsStoreTests(unittest.TestCase):
                 "https://api.deepseek.com/chat/completions",
             )
             self.assertEqual(actual.meeting_minutes_extra_body, '{"stream": false}')
+            self.assertEqual(actual.visual_provider, "openai")
+            self.assertEqual(actual.visual_model, "gpt-4.1-mini")
+            self.assertEqual(
+                actual.visual_api_url,
+                "https://api.openai.com/v1/chat/completions",
+            )
+            self.assertEqual(actual.visual_extra_body, '{"top_p": 0.8}')
+            self.assertEqual(actual.visual_key_source, "independent")
+
+    def test_old_settings_gain_optional_visual_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            path.write_text(
+                '{"meeting_minutes_model":"qwen-max"}',
+                encoding="utf-8",
+            )
+            settings = load_settings(path)
+            self.assertEqual(settings.visual_model, "qwen3-vl-plus")
+            self.assertEqual(settings.visual_key_source, "interpreter")
 
 if __name__ == "__main__":
     unittest.main()

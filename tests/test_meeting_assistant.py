@@ -66,6 +66,10 @@ def make_turn(
 
 
 class TimelineTests(unittest.TestCase):
+    def test_visual_evidence_citation_is_grounded(self) -> None:
+        answer = "该页显示收入增长。[画面 09:00:00 第1页]"
+        self.assertEqual(ensure_grounded_answer(answer), answer)
+
     def test_timeline_is_sorted_filtered_and_searchable(self) -> None:
         turns = (
             make_turn(20, "outgoing", "第二句", "Second sentence"),
@@ -186,8 +190,30 @@ class ClientTests(unittest.TestCase):
         )
         self.assertIn("预算已确认", requests[0]["messages"][1]["content"])
         self.assertIn("当前记录中未找到依据", requests[0]["messages"][1]["content"])
+        self.assertNotIn("shared_screen_context", requests[0]["messages"][1]["content"])
         self.assertEqual(result.usage.input_tokens, 12)
         self.assertEqual(result.usage.output_tokens, 6)
+
+    def test_visual_only_question_uses_page_context(self) -> None:
+        requests = []
+
+        def opener(request, **_kwargs):
+            requests.append(json.loads(request.data.decode("utf-8")))
+            return FakeResponse("收入增长 10%。[画面 09:00:00 第1页]")
+
+        client = MeetingAssistantClient(
+            "key",
+            "https://api.example.com/v1",
+            "vision-capable-model",
+            opener=opener,
+        )
+        result = client.answer(
+            "本页收入如何？",
+            (),
+            visual_context="[画面 09:00:00 第1页]\n收入增长 10%",
+        )
+        self.assertIn("shared_screen_context", requests[0]["messages"][1]["content"])
+        self.assertIn("收入增长", result.content)
 
     def test_incremental_insight_processes_all_chunks(self) -> None:
         requests = []

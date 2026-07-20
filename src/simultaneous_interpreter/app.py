@@ -14,10 +14,13 @@ from .audio_devices import AudioDeviceCatalog, AudioDeviceChoice
 from .credential_store import (
     clear_credentials,
     clear_minutes_api_key,
+    clear_visual_api_key,
     load_credentials,
     load_minutes_api_key,
+    load_visual_api_key,
     save_credentials,
     save_minutes_api_key,
+    save_visual_api_key,
 )
 from .diagnostics import ConnectionDiagnosticLogger
 from .meeting_minutes import (
@@ -27,19 +30,30 @@ from .meeting_minutes import (
     OpenAICompatibleMeetingMinutesClient,
     normalize_model_name,
 )
+from .minutes_export import (
+    export_minutes_with_assets,
+    select_referenced_visual_moments,
+)
 from .meeting_assistant import MeetingAssistantClient
 from .meeting_assistant_window import MeetingAssistantWindow
 from .provider_config import (
     INTERPRETER_BY_ID,
     INTERPRETER_BY_LABEL,
     INTERPRETER_PROVIDERS,
+    INTERPRETER_QWEN,
     INTERPRETER_QWEN_COMPATIBLE,
     LLM_BY_ID,
     LLM_BY_LABEL,
     LLM_PROVIDERS,
     LLM_QWEN_WORKSPACE,
+    VISION_BY_ID,
+    VISION_BY_LABEL,
+    VISION_PROVIDERS,
+    VISION_QWEN_WORKSPACE,
     parse_extra_body,
     resolve_minutes_url,
+    resolve_vision_url,
+    validate_visual_key_source,
 )
 from .qwen_backend import (
     ConnectionStatus,
@@ -51,6 +65,15 @@ from .qwen_backend import (
 )
 from .settings_store import AppSettings, load_settings, save_settings
 from .subtitle_overlay import SubtitleOverlay
+from .visual_analysis import (
+    DEFAULT_VISION_MODEL,
+    OpenAICompatibleVisionClient,
+    VisualMoment,
+    format_visual_context,
+    normalize_vision_model,
+    select_minutes_visual_moments,
+    trim_visual_media,
+)
 from . import ui_theme as ui
 
 
@@ -58,6 +81,12 @@ from . import ui_theme as ui
 class UiMessage:
     kind: str
     payload: Any = None
+
+
+@dataclass(frozen=True)
+class _GeneratedMinutes:
+    result: MinutesResult
+    visual_moments: tuple[VisualMoment, ...]
 
 
 class InterpreterApp:
@@ -78,6 +107,16 @@ class InterpreterApp:
         "qwen-plus",
         "qwen-max",
     )
+    VISION_MODEL_CHOICES = (
+        "qwen3-vl-plus",
+    )
+    VISION_KEY_CHOICES = (
+        ("复用百炼同传 Key", "interpreter"),
+        ("独立视觉 API Key", "independent"),
+        ("复用会议纪要 Key", "minutes"),
+    )
+    VISION_KEY_IDS = dict(VISION_KEY_CHOICES)
+    VISION_KEY_LABELS = {value: label for label, value in VISION_KEY_CHOICES}
 
     def __init__(self) -> None:
         try:
@@ -88,6 +127,10 @@ class InterpreterApp:
             saved_minutes_api_key = load_minutes_api_key()
         except OSError:
             saved_minutes_api_key = ""
+        try:
+            saved_visual_api_key = load_visual_api_key()
+        except OSError:
+            saved_visual_api_key = ""
         saved_settings = load_settings()
 
         self.root = tk.Tk()
@@ -110,10 +153,14 @@ class InterpreterApp:
         self._catalog = AudioDeviceCatalog()
         self._choice_maps: dict[str, dict[str, AudioDeviceChoice]] = {}
         self._meeting_turns: list[MeetingTurn] = []
+        self._visual_moments: list[VisualMoment] = []
         self._meeting_started_at: datetime | None = None
         self._meeting_ended_at: datetime | None = None
         self._minutes_generating = False
         self._minutes_window: tk.Toplevel | None = None
+        self._minutes_export_moments: tuple[VisualMoment, ...] = ()
+        self._minutes_save_button: ttk.Button | None = None
+        self._minutes_export_hint_var: tk.StringVar | None = None
         self._settings_window: tk.Toplevel | None = None
         self._settings_snapshot: dict[str, str] | None = None
         self._settings_error_var: tk.StringVar | None = None
@@ -134,6 +181,7 @@ class InterpreterApp:
         )
         interpreter_preset = INTERPRETER_BY_ID[saved_settings.interpreter_provider]
         minutes_preset = LLM_BY_ID[saved_settings.meeting_minutes_provider]
+        visual_preset = VISION_BY_ID[saved_settings.visual_provider]
         self.interpreter_provider_var = tk.StringVar(value=interpreter_preset.label)
         self.interpreter_model_var = tk.StringVar(
             value=os.getenv("INTERPRETER_MODEL", "")
@@ -156,6 +204,23 @@ class InterpreterApp:
             value=os.getenv("MINUTES_EXTRA_BODY", "")
             or saved_settings.meeting_minutes_extra_body
         )
+        self.visual_provider_var = tk.StringVar(value=visual_preset.label)
+        self.visual_model_var = tk.StringVar(
+            value=saved_settings.visual_model or DEFAULT_VISION_MODEL
+        )
+        self.visual_api_key_var = tk.StringVar(value=saved_visual_api_key)
+        self.visual_api_url_var = tk.StringVar(
+            value=saved_settings.visual_api_url or visual_preset.api_url
+        )
+        self.visual_extra_body_var = tk.StringVar(
+            value=saved_settings.visual_extra_body
+        )
+        self.visual_key_source_var = tk.StringVar(
+            value=self.VISION_KEY_LABELS.get(
+                saved_settings.visual_key_source,
+                self.VISION_KEY_LABELS["interpreter"],
+            )
+        )
         self.microphone_var = tk.StringVar()
         self.loopback_var = tk.StringVar()
         self.output_var = tk.StringVar()
@@ -176,6 +241,7 @@ class InterpreterApp:
         self.presentation_button_var = tk.StringVar(value="显示演示字幕")
         self.show_api_key_var = tk.BooleanVar(value=False)
         self.show_minutes_api_key_var = tk.BooleanVar(value=False)
+        self.show_visual_api_key_var = tk.BooleanVar(value=False)
 
         self._configure_style()
         self._subtitle_overlay = SubtitleOverlay(
@@ -678,6 +744,12 @@ class InterpreterApp:
             "minutes_api_key": self.minutes_api_key_var,
             "minutes_api_url": self.minutes_api_url_var,
             "minutes_extra_body": self.minutes_extra_body_var,
+            "visual_provider": self.visual_provider_var,
+            "visual_model": self.visual_model_var,
+            "visual_api_key": self.visual_api_key_var,
+            "visual_api_url": self.visual_api_url_var,
+            "visual_extra_body": self.visual_extra_body_var,
+            "visual_key_source": self.visual_key_source_var,
         }
 
     def _open_settings(self) -> None:
@@ -695,7 +767,7 @@ class InterpreterApp:
         window = tk.Toplevel(self.root)
         self._settings_window = window
         window.title("模型供应商设置")
-        window.geometry("860x650")
+        window.geometry("900x680")
         window.minsize(720, 560)
         window.configure(bg=ui.BACKGROUND)
         window.transient(self.root)
@@ -725,16 +797,29 @@ class InterpreterApp:
             style="Surface.TFrame",
             padding=ui.SPACE_4,
         )
+        self.visual_settings_tab = ttk.Frame(
+            notebook,
+            style="Surface.TFrame",
+            padding=ui.SPACE_4,
+        )
         notebook.add(self.interpreter_settings_tab, text="同声翻译")
         notebook.add(self.minutes_settings_tab, text="AI 会议纪要")
+        notebook.add(self.visual_settings_tab, text="共享画面 AI")
         self._build_interpreter_settings_tab(self.interpreter_settings_tab)
         self._build_minutes_settings_tab(self.minutes_settings_tab)
+        self._build_visual_settings_tab(self.visual_settings_tab)
 
         self.interpreter_provider_combo.bind(
             "<<ComboboxSelected>>", self._on_interpreter_provider_changed
         )
         self.minutes_provider_combo.bind(
             "<<ComboboxSelected>>", self._on_minutes_provider_changed
+        )
+        self.visual_provider_combo.bind(
+            "<<ComboboxSelected>>", self._on_visual_provider_changed
+        )
+        self.visual_key_source_combo.bind(
+            "<<ComboboxSelected>>", self._on_visual_key_source_changed
         )
 
         self._settings_error_var = tk.StringVar()
@@ -781,6 +866,10 @@ class InterpreterApp:
             "minutes_api_key": self.minutes_api_key_entry,
             "minutes_url": self.minutes_api_url_entry,
             "minutes_extra": self.minutes_extra_body_entry,
+            "visual_model": self.visual_model_combo,
+            "visual_api_key": self.visual_api_key_entry,
+            "visual_url": self.visual_api_url_entry,
+            "visual_extra": self.visual_extra_body_entry,
         }
         self._apply_provider_controls()
         self._toggle_secret_visibility()
@@ -1062,6 +1151,156 @@ class InterpreterApp:
             pady=(ui.SPACE_1, 0),
         )
 
+    def _build_visual_settings_tab(self, tab: ttk.Frame) -> None:
+        for column in range(2):
+            tab.columnconfigure(column, weight=1)
+        ttk.Label(
+            tab,
+            text=(
+                "配置支持 OpenAI image_url 输入的视觉模型。功能默认关闭，"
+                "只有主动选择屏幕区域后才会发送截图。"
+            ),
+            style="Helper.TLabel",
+            wraplength=800,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, ui.SPACE_4))
+        ttk.Label(tab, text="视觉模型供应商", style="Surface.TLabel").grid(
+            row=1, column=0, sticky="w"
+        )
+        ttk.Label(tab, text="视觉模型", style="Surface.TLabel").grid(
+            row=1,
+            column=1,
+            sticky="w",
+            padx=(ui.SPACE_3, 0),
+        )
+        self.visual_provider_combo = ttk.Combobox(
+            tab,
+            textvariable=self.visual_provider_var,
+            state="readonly",
+            values=tuple(item.label for item in VISION_PROVIDERS),
+        )
+        self.visual_provider_combo.grid(row=2, column=0, sticky="ew")
+        self.visual_model_combo = ttk.Combobox(
+            tab,
+            textvariable=self.visual_model_var,
+            values=self.VISION_MODEL_CHOICES,
+        )
+        self.visual_model_combo.grid(
+            row=2,
+            column=1,
+            sticky="ew",
+            padx=(ui.SPACE_3, 0),
+        )
+
+        ttk.Label(tab, text="API Key 来源", style="Surface.TLabel").grid(
+            row=3,
+            column=0,
+            sticky="w",
+            pady=(ui.SPACE_4, 0),
+        )
+        ttk.Label(tab, text="独立视觉 API Key", style="Surface.TLabel").grid(
+            row=3,
+            column=1,
+            sticky="w",
+            padx=(ui.SPACE_3, 0),
+            pady=(ui.SPACE_4, 0),
+        )
+        self.visual_key_source_combo = ttk.Combobox(
+            tab,
+            textvariable=self.visual_key_source_var,
+            state="readonly",
+            values=tuple(label for label, _value in self.VISION_KEY_CHOICES),
+        )
+        self.visual_key_source_combo.grid(row=4, column=0, sticky="ew")
+        visual_key_field = ttk.Frame(tab, style="Surface.TFrame")
+        visual_key_field.grid(
+            row=4,
+            column=1,
+            sticky="ew",
+            padx=(ui.SPACE_3, 0),
+        )
+        visual_key_field.columnconfigure(0, weight=1)
+        self.visual_api_key_entry = ttk.Entry(
+            visual_key_field,
+            textvariable=self.visual_api_key_var,
+            show="●",
+        )
+        self.visual_api_key_entry.grid(row=0, column=0, sticky="ew")
+        ttk.Checkbutton(
+            visual_key_field,
+            text="显示",
+            variable=self.show_visual_api_key_var,
+            command=self._toggle_secret_visibility,
+            style="Surface.TCheckbutton",
+        ).grid(row=0, column=1, padx=(ui.SPACE_2, 0))
+        self.visual_key_helper = ttk.Label(
+            tab,
+            text="只有供应商相同时才允许复用 Key；独立 Key 保存到 Windows 凭据管理器。",
+            style="Helper.TLabel",
+        )
+        self.visual_key_helper.grid(
+            row=5,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(ui.SPACE_1, ui.SPACE_4),
+        )
+
+        ttk.Label(
+            tab,
+            text="Chat Completions 地址",
+            style="Surface.TLabel",
+        ).grid(row=6, column=0, columnspan=2, sticky="w")
+        self.visual_api_url_entry = ttk.Entry(
+            tab,
+            textvariable=self.visual_api_url_var,
+        )
+        self.visual_api_url_entry.grid(
+            row=7,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+        )
+        ttk.Label(
+            tab,
+            text="百炼 Workspace 地址会自动生成；其他供应商可填写根路径或完整端点。",
+            style="Helper.TLabel",
+        ).grid(
+            row=8,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(ui.SPACE_1, ui.SPACE_4),
+        )
+
+        ttk.Label(tab, text="附加请求参数 JSON", style="Surface.TLabel").grid(
+            row=9, column=0, columnspan=2, sticky="w"
+        )
+        self.visual_extra_body_entry = ttk.Entry(
+            tab,
+            textvariable=self.visual_extra_body_var,
+        )
+        self.visual_extra_body_entry.grid(
+            row=10,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+        )
+        ttk.Label(
+            tab,
+            text=(
+                "截图压缩后以内存 Base64 发送，不创建临时文件；"
+                "请确认会议参与者和组织政策允许云端画面分析。"
+            ),
+            style="Helper.TLabel",
+            wraplength=800,
+        ).grid(
+            row=11,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(ui.SPACE_1, 0),
+        )
+
     def _close_settings(self) -> None:
         window = self._settings_window
         self._settings_window = None
@@ -1096,6 +1335,10 @@ class InterpreterApp:
             self.minutes_api_key_entry.configure(
                 show="" if self.show_minutes_api_key_var.get() else "●"
             )
+        if hasattr(self, "visual_api_key_entry"):
+            self.visual_api_key_entry.configure(
+                show="" if self.show_visual_api_key_var.get() else "●"
+            )
 
     def _show_settings_error(self, message: str) -> None:
         if not self._settings_error_var or not self._settings_window:
@@ -1126,6 +1369,16 @@ class InterpreterApp:
         elif "会议纪要" in message or "独立的 API Key" in message:
             target = "minutes_api_key"
             tab = self.minutes_settings_tab
+        if "共享画面" in message or "视觉" in message:
+            tab = self.visual_settings_tab
+            if "附加" in message or "json" in lowered:
+                target = "visual_extra"
+            elif "chat completions" in lowered or "地址" in message:
+                target = "visual_url"
+            elif "模型" in message:
+                target = "visual_model"
+            else:
+                target = "visual_api_key"
         self.settings_notebook.select(tab)
         widget = self._settings_focus_targets.get(target)
         if widget:
@@ -1242,9 +1495,26 @@ class InterpreterApp:
             raise ValueError("请选择有效的会议纪要 LLM 供应商")
         return preset.provider_id
 
+    def _visual_provider_id(self) -> str:
+        preset = VISION_BY_LABEL.get(self.visual_provider_var.get())
+        if preset is None:
+            raise ValueError("请选择有效的共享画面 AI 供应商")
+        return preset.provider_id
+
+    def _visual_key_source_id(self) -> str:
+        source = self.VISION_KEY_IDS.get(self.visual_key_source_var.get())
+        if source is None:
+            raise ValueError("请选择有效的共享画面 API Key 来源")
+        return source
+
     def _current_settings(self) -> AppSettings:
         extra_body = self.minutes_extra_body_var.get().strip() or "{}"
         parse_extra_body(extra_body)
+        visual_extra_body = self.visual_extra_body_var.get().strip() or "{}"
+        try:
+            parse_extra_body(visual_extra_body)
+        except ValueError as exc:
+            raise ValueError(f"共享画面附加参数无效：{exc}") from exc
         return AppSettings(
             interpreter_provider=self._interpreter_provider_id(),
             interpreter_model=normalize_realtime_model_name(
@@ -1255,6 +1525,11 @@ class InterpreterApp:
             meeting_minutes_model=normalize_model_name(self.minutes_model_var.get()),
             meeting_minutes_api_url=self.minutes_api_url_var.get().strip(),
             meeting_minutes_extra_body=extra_body,
+            visual_provider=self._visual_provider_id(),
+            visual_model=normalize_vision_model(self.visual_model_var.get()),
+            visual_api_url=self.visual_api_url_var.get().strip(),
+            visual_extra_body=visual_extra_body,
+            visual_key_source=self._visual_key_source_id(),
         )
 
     def _validate_interpreter_settings(self, settings: AppSettings) -> str:
@@ -1302,9 +1577,38 @@ class InterpreterApp:
             if minutes_id == LLM_QWEN_WORKSPACE
             else ()
         )
+        visual_id = self._visual_provider_id()
+        visual_key_source = self._visual_key_source_id()
+        self.visual_api_url_entry.configure(
+            state="disabled"
+            if running or visual_id == VISION_QWEN_WORKSPACE
+            else "normal"
+        )
+        self.visual_model_combo.configure(
+            values=(
+                self.VISION_MODEL_CHOICES
+                if visual_id == VISION_QWEN_WORKSPACE
+                else ()
+            )
+        )
+        self.visual_api_key_entry.configure(
+            state=(
+                "normal"
+                if not running and visual_key_source == "independent"
+                else "disabled"
+            )
+        )
 
     def _on_interpreter_provider_changed(self, _event: object = None) -> None:
         self._clear_settings_error()
+        if (
+            self._visual_key_source_id() == "interpreter"
+            and (
+                self._interpreter_provider_id() != INTERPRETER_QWEN
+                or self._visual_provider_id() != VISION_QWEN_WORKSPACE
+            )
+        ):
+            self.visual_key_source_var.set(self.VISION_KEY_LABELS["independent"])
         self._apply_provider_controls()
 
     def _sync_voice_choices(self) -> None:
@@ -1328,9 +1632,41 @@ class InterpreterApp:
                 self.minutes_model_var.set(DEFAULT_MINUTES_MODEL)
         elif self.minutes_model_var.get().strip() in self.MINUTES_MODEL_CHOICES:
             self.minutes_model_var.set("")
+        if (
+            self._visual_key_source_id() == "minutes"
+            and self._visual_provider_id() != self._minutes_provider_id()
+        ):
+            self.visual_key_source_var.set(self.VISION_KEY_LABELS["independent"])
         self._apply_provider_controls()
         if preset and preset.provider_id != LLM_QWEN_WORKSPACE:
             self._set_status("请填写该供应商实际开放的会议纪要模型名", "info")
+
+    def _on_visual_provider_changed(self, _event: object = None) -> None:
+        self._clear_settings_error()
+        preset = VISION_BY_LABEL.get(self.visual_provider_var.get())
+        if preset and preset.api_url:
+            self.visual_api_url_var.set(preset.api_url)
+        if preset and preset.provider_id == VISION_QWEN_WORKSPACE:
+            if not self.visual_model_var.get().strip():
+                self.visual_model_var.set(DEFAULT_VISION_MODEL)
+        elif self.visual_model_var.get().strip() in self.VISION_MODEL_CHOICES:
+            self.visual_model_var.set("")
+        source = self._visual_key_source_id()
+        if source == "interpreter" and (
+            not preset
+            or preset.provider_id != VISION_QWEN_WORKSPACE
+            or self._interpreter_provider_id() != INTERPRETER_QWEN
+        ):
+            self.visual_key_source_var.set(self.VISION_KEY_LABELS["independent"])
+        elif source == "minutes" and (
+            not preset or preset.provider_id != self._minutes_provider_id()
+        ):
+            self.visual_key_source_var.set(self.VISION_KEY_LABELS["independent"])
+        self._apply_provider_controls()
+
+    def _on_visual_key_source_changed(self, _event: object = None) -> None:
+        self._clear_settings_error()
+        self._apply_provider_controls()
 
     def _resolved_minutes_api_key(self, provider_id: str) -> str:
         configured = self.minutes_api_key_var.get().strip()
@@ -1344,6 +1680,27 @@ class InterpreterApp:
         if provider_id == "ollama":
             return ""
         raise ValueError("该会议纪要供应商需要填写独立的 API Key")
+
+    def _resolved_visual_api_key(self, provider_id: str, source: str) -> str:
+        validate_visual_key_source(
+            provider_id,
+            source,
+            minutes_provider_id=self._minutes_provider_id(),
+            interpreter_provider_id=self._interpreter_provider_id(),
+        )
+        if source == "independent":
+            key = self.visual_api_key_var.get().strip()
+            if key or provider_id == "ollama":
+                return key
+            raise ValueError("共享画面 AI 需要填写独立的 API Key")
+        if source == "minutes":
+            return self._resolved_minutes_api_key(provider_id)
+        if source == "interpreter":
+            key = self.api_key_var.get().strip()
+            if not key:
+                raise ValueError("请先配置百炼同传 API Key")
+            return key
+        raise ValueError("共享画面 API Key 来源无效")
 
     def _save_credentials(self) -> bool:
         workspace_id = self.workspace_id_var.get().strip()
@@ -1374,6 +1731,10 @@ class InterpreterApp:
                 save_minutes_api_key(self.minutes_api_key_var.get())
             else:
                 clear_minutes_api_key()
+            if self.visual_api_key_var.get().strip():
+                save_visual_api_key(self.visual_api_key_var.get())
+            else:
+                clear_visual_api_key()
             save_settings(settings)
         except (OSError, ValueError) as exc:
             self._show_settings_error(str(exc))
@@ -1381,13 +1742,15 @@ class InterpreterApp:
         self.interpreter_model_var.set(settings.interpreter_model)
         self.minutes_model_var.set(settings.meeting_minutes_model)
         self.minutes_extra_body_var.set(settings.meeting_minutes_extra_body)
+        self.visual_model_var.set(settings.visual_model)
+        self.visual_extra_body_var.set(settings.visual_extra_body)
         self._set_status("配置已保存", "info")
         return True
 
     def _clear_credentials(self) -> None:
         if not messagebox.askyesno(
             "清除凭据",
-            "确定从 Windows 凭据管理器中删除百炼和会议纪要凭据吗？",
+            "确定从 Windows 凭据管理器中删除同传、会议纪要和共享画面 AI 凭据吗？",
         ):
             return
         try:
@@ -1397,10 +1760,12 @@ class InterpreterApp:
             return
         self.api_key_var.set("")
         self.minutes_api_key_var.set("")
+        self.visual_api_key_var.set("")
         self.workspace_id_var.set("")
         if self._settings_snapshot is not None:
             self._settings_snapshot["interpreter_api_key"] = ""
             self._settings_snapshot["minutes_api_key"] = ""
+            self._settings_snapshot["visual_api_key"] = ""
             self._settings_snapshot["workspace_id"] = ""
         self._set_status("凭据已清除", "warning")
 
@@ -1474,6 +1839,8 @@ class InterpreterApp:
         if self._state not in {"running", "starting"}:
             return
         self._state = "stopping"
+        if self._meeting_assistant is not None:
+            self._meeting_assistant.stop_visual_capture()
         self._subtitle_overlay.clear_connection_notice()
         self._set_status("正在停止…", "busy", busy=True)
         self.stop_button.configure(state="disabled")
@@ -1511,6 +1878,46 @@ class InterpreterApp:
             extra_body=extra_body,
         )
 
+    def _create_vision_client(self) -> OpenAICompatibleVisionClient:
+        provider_id = self._visual_provider_id()
+        source = self._visual_key_source_id()
+        api_key = self._resolved_visual_api_key(provider_id, source)
+        model = normalize_vision_model(self.visual_model_var.get())
+        api_url = resolve_vision_url(
+            provider_id,
+            self.workspace_id_var.get().strip(),
+            self.visual_api_url_var.get(),
+        )
+        extra_body = parse_extra_body(self.visual_extra_body_var.get())
+        if provider_id == VISION_QWEN_WORKSPACE:
+            extra_body.setdefault("enable_thinking", False)
+        return OpenAICompatibleVisionClient(
+            api_key,
+            api_url,
+            model,
+            provider_name=VISION_BY_ID[provider_id].label,
+            extra_body=extra_body,
+        )
+
+    def _append_visual_moment(self, moment: VisualMoment) -> None:
+        self._visual_moments.append(moment)
+        self._visual_moments[:] = trim_visual_media(self._visual_moments)
+
+    def _log_visual_event(
+        self,
+        state: str,
+        page: int,
+        elapsed_ms: int,
+        error_type: str,
+    ) -> None:
+        if self._diagnostic_logger:
+            self._diagnostic_logger.log_visual(
+                state=state,
+                page=page,
+                elapsed_ms=elapsed_ms,
+                error_type=error_type,
+            )
+
     def _show_meeting_assistant(self) -> None:
         if self._meeting_assistant is None:
             self._meeting_assistant = MeetingAssistantWindow(
@@ -1518,6 +1925,11 @@ class InterpreterApp:
                 self._fonts,
                 lambda: tuple(self._meeting_turns),
                 self._create_meeting_assistant_client,
+                lambda: tuple(self._visual_moments),
+                self._append_visual_moment,
+                self._create_vision_client,
+                lambda: self._state == "running",
+                self._log_visual_event,
             )
         self._meeting_assistant.show()
 
@@ -1548,6 +1960,13 @@ class InterpreterApp:
         self.minutes_model_var.set(minutes_model)
 
         turns = tuple(self._meeting_turns)
+        visual_moments = tuple(self._visual_moments)
+        minutes_visual_moments = select_minutes_visual_moments(visual_moments)
+        visual_context = format_visual_context(
+            visual_moments,
+            turns,
+            key_pages=True,
+        )
         started_at = self._meeting_started_at or turns[0].recorded_at
         ended_at = self._meeting_ended_at or turns[-1].recorded_at
         self._minutes_generating = True
@@ -1565,6 +1984,8 @@ class InterpreterApp:
                 turns,
                 started_at,
                 ended_at,
+                visual_context,
+                minutes_visual_moments,
             ),
             name="meeting-minutes",
             daemon=True,
@@ -1580,6 +2001,8 @@ class InterpreterApp:
         turns: tuple[MeetingTurn, ...],
         started_at: datetime,
         ended_at: datetime,
+        visual_context: str,
+        visual_moments: tuple[VisualMoment, ...],
     ) -> None:
         try:
             client = OpenAICompatibleMeetingMinutesClient(
@@ -1589,8 +2012,16 @@ class InterpreterApp:
                 provider_name=provider_name,
                 extra_body=extra_body,
             )
-            result = client.generate(turns, started_at, ended_at)
-            self._post("minutes_ready", result)
+            result = client.generate(
+                turns,
+                started_at,
+                ended_at,
+                visual_context,
+            )
+            self._post(
+                "minutes_ready",
+                _GeneratedMinutes(result, visual_moments),
+            )
         except Exception as exc:
             self._post("minutes_failed", str(exc))
 
@@ -1628,6 +2059,8 @@ class InterpreterApp:
             self._set_status("启动失败", "error", busy=False)
             self._subtitle_overlay.clear_connection_notice()
             self._set_controls_running(False)
+            if self._meeting_assistant is not None:
+                self._meeting_assistant.stop_visual_capture()
             messagebox.showerror("启动失败", str(message.payload))
         elif message.kind == "stopped":
             self._state = "idle"
@@ -1638,6 +2071,8 @@ class InterpreterApp:
             self._had_connection_interruption = False
             self._subtitle_overlay.clear_connection_notice()
             self._set_controls_running(False)
+            if self._meeting_assistant is not None:
+                self._meeting_assistant.stop_visual_capture()
             self.incoming_interim_var.set("等待对方说英文…")
             self.outgoing_interim_var.set("等待你说中文…")
         elif message.kind == "incoming":
@@ -1683,8 +2118,13 @@ class InterpreterApp:
                 f"文本 {usage.input_text_tokens + usage.output_text_tokens}"
             )
         elif message.kind == "minutes_ready":
-            result: MinutesResult = message.payload
+            generated: _GeneratedMinutes = message.payload
+            result = generated.result
             self._minutes_generating = False
+            self._minutes_export_moments = select_referenced_visual_moments(
+                result.markdown,
+                generated.visual_moments
+            )
             self._set_status(
                 "会议纪要已生成："
                 f"输入 {result.input_tokens} / 输出 {result.output_tokens} Token",
@@ -1859,22 +2299,37 @@ class InterpreterApp:
         self.presentation_button_var.set("显示演示字幕")
 
     def _clear_history(self) -> None:
-        if self._meeting_turns and not messagebox.askyesno(
+        if (self._meeting_turns or self._visual_moments) and not messagebox.askyesno(
             "清空会议记录",
-            "清空后将无法基于当前字幕生成会议纪要，确定继续吗？",
+            "清空后将删除当前字幕、共享画面分析和内存图片，确定继续吗？",
         ):
             return
         for history in (self.incoming_history, self.outgoing_history):
             self._reset_history(history)
         self._meeting_turns.clear()
+        self._visual_moments.clear()
+        self._minutes_export_moments = ()
+        if self._minutes_save_button is not None:
+            try:
+                self._minutes_save_button.configure(text="保存 Markdown")
+            except tk.TclError:
+                self._minutes_save_button = None
+        if self._minutes_export_hint_var is not None:
+            self._minutes_export_hint_var.set(
+                "共享画面截图已清除，保存时仅包含文字 Markdown。"
+            )
         self._meeting_started_at = None
         self._meeting_ended_at = None
         self._subtitle_overlay.reset()
+        if self._meeting_assistant is not None:
+            self._meeting_assistant.records_cleared()
         self._update_minutes_button()
 
     def _show_minutes_window(self, markdown: str) -> None:
         if self._minutes_window and self._minutes_window.winfo_exists():
             self._minutes_window.destroy()
+        self._minutes_save_button = None
+        self._minutes_export_hint_var = None
 
         window = tk.Toplevel(self.root)
         self._minutes_window = window
@@ -1912,15 +2367,41 @@ class InterpreterApp:
             text=self._meeting_time_summary(),
             style="Helper.TLabel",
         ).pack(anchor="w", pady=(ui.SPACE_1, 0))
-        ttk.Button(
+        exportable_count = sum(
+            1
+            for moment in self._minutes_export_moments
+            if moment.image_jpeg or moment.thumbnail_jpeg
+        )
+        missing_count = len(self._minutes_export_moments) - exportable_count
+        if exportable_count:
+            export_hint = f"保存时将附带 {exportable_count} 张关键截图"
+            if missing_count:
+                export_hint += f"，另有 {missing_count} 张图片已释放"
+            export_hint += "；分享时请同时携带图片目录。"
+        elif missing_count:
+            export_hint = "关键页面图片已从内存释放，保存时仅包含文字说明。"
+        else:
+            export_hint = "保存为 UTF-8 Markdown 文件。"
+        self._minutes_export_hint_var = tk.StringVar(value=export_hint)
+        ttk.Label(
+            title_group,
+            textvariable=self._minutes_export_hint_var,
+            style="Helper.TLabel",
+        ).pack(anchor="w", pady=(ui.SPACE_1, 0))
+        self._minutes_save_button = ttk.Button(
             toolbar,
-            text="保存 Markdown",
+            text=(
+                "保存纪要和截图"
+                if exportable_count
+                else "保存 Markdown"
+            ),
             style="Primary.TButton",
             command=lambda: self._save_minutes(markdown),
-        ).pack(side="right")
+        )
+        self._minutes_save_button.pack(side="right")
         ttk.Button(
             toolbar,
-            text="复制",
+            text="复制文字",
             command=lambda: self._copy_minutes(markdown),
         ).pack(side="right", padx=(0, ui.SPACE_2))
 
@@ -2021,7 +2502,7 @@ class InterpreterApp:
     def _copy_minutes(self, markdown: str) -> None:
         self.root.clipboard_clear()
         self.root.clipboard_append(markdown)
-        self._set_status("会议纪要已复制", "info")
+        self._set_status("会议纪要文字 Markdown 已复制", "info")
 
     def _save_minutes(self, markdown: str) -> None:
         started_at = self._meeting_started_at or datetime.now()
@@ -2035,11 +2516,40 @@ class InterpreterApp:
         if not path:
             return
         try:
-            Path(path).write_text(markdown, encoding="utf-8")
+            result = export_minutes_with_assets(
+                markdown,
+                self._minutes_export_moments,
+                Path(path),
+            )
         except OSError as exc:
             messagebox.showerror("保存失败", str(exc), parent=self._minutes_window)
             return
-        self._set_status("会议纪要已保存", "info")
+        if result.assets_dir is None:
+            detail = f"Markdown：{result.markdown_path}"
+            if result.skipped_count:
+                detail += (
+                    f"\n\n{result.skipped_count} 个关键页面的图片已从内存释放，"
+                    "本次只保存了文字说明。"
+                )
+            self._set_status("会议纪要 Markdown 已保存", "info")
+        else:
+            detail = (
+                f"Markdown：{result.markdown_path}\n"
+                f"图片目录：{result.assets_dir}\n"
+                f"已保存截图：{result.image_count} 张"
+            )
+            if result.skipped_count:
+                detail += f"\n未保存截图：{result.skipped_count} 张"
+            detail += "\n\n移动或分享时，请同时携带 Markdown 和图片目录。"
+            self._set_status(
+                f"会议纪要和 {result.image_count} 张关键截图已保存",
+                "info",
+            )
+        messagebox.showinfo(
+            "保存成功",
+            detail,
+            parent=self._minutes_window,
+        )
 
     def _on_close(self) -> None:
         if self._meeting_assistant is not None:

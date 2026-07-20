@@ -18,7 +18,9 @@ QUESTION_RECENT_MINUTES = 15
 QUESTION_RELEVANT_TURN_LIMIT = 12
 MAX_CONTEXT_CHARS = 12_000
 NO_EVIDENCE_RESPONSE = "当前记录中未找到依据，无法根据会议内容可靠回答。"
-_EVIDENCE_CITATION = re.compile(r"\[\d{2}:\d{2}:\d{2}\s+(?:我|对方)\]")
+_EVIDENCE_CITATION = re.compile(
+    r"\[(?:\d{2}:\d{2}:\d{2}\s+(?:我|对方)|画面\s+\d{2}:\d{2}:\d{2}(?:\s+第\d+页)?)\]"
+)
 
 
 @dataclass(frozen=True)
@@ -283,24 +285,38 @@ class MeetingAssistantClient:
         question: str,
         turns: tuple[MeetingTurn, ...],
         current_insight: str = "",
+        visual_context: str = "",
     ) -> AssistantResult:
         normalized_question = question.strip()
         if not normalized_question:
             raise ValueError("请输入会议问题")
         selected = select_question_turns(turns, normalized_question)
-        if not selected:
-            raise ValueError("当前没有可用于回答的会议记录")
+        if not selected and not visual_context.strip():
+            raise ValueError("当前没有可用于回答的会议记录或共享画面")
         transcript = bounded_transcript(selected)
+        citation_instruction = "引用格式为 `[HH:MM:SS 我/对方]`。"
+        visual_block = ""
+        if visual_context.strip():
+            citation_instruction = (
+                "字幕引用格式为 `[HH:MM:SS 我/对方]`，画面引用格式为"
+                " `[画面 HH:MM:SS 第N页]`。"
+            )
+            visual_block = (
+                "\n\n<shared_screen_context>\n"
+                f"{visual_context.strip()}\n"
+                "</shared_screen_context>"
+            )
         messages = [
             {"role": "system", "content": self._system_prompt()},
             {
                 "role": "user",
                 "content": (
                     "请依据会议记录用简体中文回答问题。回答必须引用相关证据，"
-                    "引用格式为 `[HH:MM:SS 我/对方]`。不得使用会议记录之外的知识补全；"
+                    f"{citation_instruction}不得使用会议记录之外的知识补全；"
                     "依据不足时只回答‘当前记录中未找到依据’，并简要说明缺少什么。\n\n"
                     f"<current_insight>\n{current_insight.strip()}\n</current_insight>\n\n"
-                    f"<meeting_transcript>\n{transcript}\n</meeting_transcript>\n\n"
+                    f"<meeting_transcript>\n{transcript}\n</meeting_transcript>"
+                    f"{visual_block}\n\n"
                     f"<question>\n{normalized_question}\n</question>"
                 ),
             },
@@ -316,16 +332,20 @@ class MeetingAssistantClient:
         turns: tuple[MeetingTurn, ...],
         previous_insight: str,
         processed_turn_count: int,
+        visual_context: str = "",
     ) -> InsightUpdate:
         start = min(max(0, processed_turn_count), len(turns))
         new_turns = turns[start:]
-        if not new_turns:
+        if not new_turns and not visual_context.strip():
             raise ValueError("没有新的会议内容可整理")
         insight = previous_insight.strip()
         usage = AssistantUsage()
-        for chunk in split_transcript_by_chars(new_turns):
+        chunks = split_transcript_by_chars(new_turns)
+        if not chunks:
+            chunks = ("（本次没有新增字幕，请仅依据共享画面上下文更新。）",)
+        for chunk in chunks:
             result = self._chat(
-                self._insight_messages(insight, chunk),
+                self._insight_messages(insight, chunk, visual_context),
                 max_tokens=2_000,
             )
             insight = result.content
@@ -348,7 +368,15 @@ class MeetingAssistantClient:
         self,
         previous_insight: str,
         new_transcript: str,
+        visual_context: str = "",
     ) -> list[dict[str, str]]:
+        visual_block = ""
+        if visual_context.strip():
+            visual_block = (
+                "\n\n<shared_screen_context>\n"
+                f"{visual_context.strip()}\n"
+                "</shared_screen_context>"
+            )
         return [
             {"role": "system", "content": self._system_prompt()},
             {
@@ -361,6 +389,7 @@ class MeetingAssistantClient:
                     "不能确认负责人或截止时间时写‘未明确’。\n\n"
                     f"<previous_insight>\n{previous_insight}\n</previous_insight>\n\n"
                     f"<new_transcript>\n{new_transcript}\n</new_transcript>"
+                    f"{visual_block}"
                 ),
             },
         ]

@@ -86,6 +86,28 @@ class ConnectionDiagnosticLogger:
             detail or "-",
         )
 
+    def log_visual(
+        self,
+        *,
+        state: str,
+        page: int,
+        elapsed_ms: int,
+        error_type: str = "",
+    ) -> None:
+        safe_state = sanitize_diagnostic(state)
+        safe_error_type = re.sub(
+            r"[^A-Za-z0-9_.-]",
+            "",
+            str(error_type or ""),
+        )[:80]
+        self._logger.info(
+            "feature=visual state=%s page=%d elapsed_ms=%d error_type=%s",
+            safe_state or "unknown",
+            max(0, int(page)),
+            max(0, int(elapsed_ms)),
+            safe_error_type or "-",
+        )
+
     def close(self) -> None:
         for handler in tuple(self._logger.handlers):
             handler.close()

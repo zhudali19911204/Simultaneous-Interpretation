@@ -152,6 +152,7 @@ class OpenAICompatibleMeetingMinutesClient:
         turns: tuple[MeetingTurn, ...] | list[MeetingTurn],
         started_at: datetime,
         ended_at: datetime,
+        visual_context: str = "",
     ) -> MinutesResult:
         transcript = format_transcript(turns)
         if not transcript.strip():
@@ -162,7 +163,12 @@ class OpenAICompatibleMeetingMinutesClient:
         total_output = 0
         if len(chunks) == 1:
             result = self._chat(
-                self._final_messages(chunks[0], started_at, ended_at),
+                self._final_messages(
+                    chunks[0],
+                    started_at,
+                    ended_at,
+                    visual_context=visual_context,
+                ),
                 max_tokens=4_000,
             )
             return result
@@ -178,7 +184,13 @@ class OpenAICompatibleMeetingMinutesClient:
             total_output += result.output_tokens
 
         result = self._chat(
-            self._final_messages("\n\n".join(notes), started_at, ended_at, notes=True),
+            self._final_messages(
+                "\n\n".join(notes),
+                started_at,
+                ended_at,
+                notes=True,
+                visual_context=visual_context,
+            ),
             max_tokens=4_000,
         )
         return MinutesResult(
@@ -219,9 +231,23 @@ class OpenAICompatibleMeetingMinutesClient:
         ended_at: datetime,
         *,
         notes: bool = False,
+        visual_context: str = "",
     ) -> list[dict[str, str]]:
         data_label = "meeting_notes" if notes else "meeting_transcript"
         duration = _format_duration(started_at, ended_at)
+        visual_instruction = ""
+        visual_block = ""
+        if visual_context.strip():
+            visual_instruction = (
+                "## 共享画面要点（只列出值得写入纪要的重要页面；每条必须以"
+                "‘- 第N页（HH:MM:SS）：’开头，并按页面时间总结关键数字、"
+                "结论与待确认项；N 和时间必须来自共享画面上下文）\n"
+            )
+            visual_block = (
+                "\n\n<shared_screen_context>\n"
+                f"{visual_context.strip()}\n"
+                "</shared_screen_context>"
+            )
         return [
             {"role": "system", "content": self._system_prompt()},
             {
@@ -236,6 +262,7 @@ class OpenAICompatibleMeetingMinutesClient:
                     "缺失信息写‘未明确’）\n"
                     "## 关键讨论\n"
                     "## 风险与未决问题\n"
+                    f"{visual_instruction}"
                     "若某部分没有内容，写‘未明确’，不要省略标题。"
                     "系统只能区分‘我’和‘对方’，除非内容明确提到姓名，否则不要猜测。\n\n"
                     f"会议日期：{started_at:%Y-%m-%d}\n"
@@ -243,6 +270,7 @@ class OpenAICompatibleMeetingMinutesClient:
                     f"结束时间：{ended_at:%H:%M:%S}\n"
                     f"时长：{duration}\n\n"
                     f"<{data_label}>\n{content}\n</{data_label}>"
+                    f"{visual_block}"
                 ),
             },
         ]

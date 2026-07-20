@@ -49,6 +49,22 @@ class DiagnosticTests(unittest.TestCase):
             self.assertIn("attempt=2", text)
             self.assertIn("TimeoutError", text)
 
+    def test_visual_log_contains_metadata_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "logs" / "interpreter.log"
+            logger = ConnectionDiagnosticLogger(path)
+            logger.log_visual(
+                state="analysis_ready",
+                page=3,
+                elapsed_ms=1250,
+                error_type="",
+            )
+            logger.close()
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("feature=visual", text)
+            self.assertIn("page=3", text)
+            self.assertIn("elapsed_ms=1250", text)
+
 
 if __name__ == "__main__":
     unittest.main()

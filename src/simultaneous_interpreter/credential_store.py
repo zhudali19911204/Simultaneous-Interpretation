@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 TARGET_NAME = "QwenTeamsInterpreter/DashScope"
 MINUTES_TARGET_NAME = "QwenTeamsInterpreter/MeetingMinutes"
+VISION_TARGET_NAME = "QwenTeamsInterpreter/VisualAnalysis"
 CRED_TYPE_GENERIC = 1
 CRED_PERSIST_LOCAL_MACHINE = 2
 ERROR_NOT_FOUND = 1168
@@ -159,6 +160,25 @@ def clear_minutes_api_key() -> None:
     _delete_credential(MINUTES_TARGET_NAME)
 
 
+def save_visual_api_key(api_key: str) -> None:
+    _save_credential(
+        VISION_TARGET_NAME,
+        api_key,
+        "visual-analysis",
+        "共享画面 AI 服务",
+    )
+
+
+def load_visual_api_key() -> str:
+    value = _load_credential(VISION_TARGET_NAME)
+    return value[0] if value else ""
+
+
+def clear_visual_api_key() -> None:
+    _delete_credential(VISION_TARGET_NAME)
+
+
 def clear_credentials() -> None:
     _delete_credential(TARGET_NAME)
     _delete_credential(MINUTES_TARGET_NAME)
+    _delete_credential(VISION_TARGET_NAME)
