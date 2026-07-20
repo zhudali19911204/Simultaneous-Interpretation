@@ -25,10 +25,22 @@ from simultaneous_interpreter.qwen_backend import (  # noqa: E402
     OUTPUT_SAMPLE_RATE,
     PLAYBACK_BLOCK_FRAMES,
     QwenLiveTranslateClient,
+    TranslationAligner,
     UsageStats,
     build_api_url,
     reconnect_delay,
 )
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
 
 class FakePlayback:
@@ -399,6 +411,155 @@ class ReconnectionTests(unittest.TestCase):
         self.assertEqual(errors, [])
 
 
+    def test_reconnect_flushes_old_pair_and_ignores_stale_generation(self) -> None:
+        client, events, _, _, _ = make_client()
+        client._generation = 1
+        client._handle_message(
+            json.dumps(
+                {
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "item_id": "source-old",
+                    "transcript": "Old source",
+                }
+            )
+        )
+        client._flush_alignment("disconnect")
+        self.assertEqual(events[-1].alignment_status, "source_only")
+
+        client._generation = 2
+        client._reset_alignment()
+        client._on_message(
+            1,
+            object(),  # type: ignore[arg-type]
+            json.dumps(
+                {
+                    "type": "response.text.done",
+                    "response_id": "resp-old",
+                    "text": "旧译文",
+                },
+                ensure_ascii=False,
+            ),
+        )
+        self.assertEqual(len([event for event in events if event.is_final]), 1)
+
+        client._handle_message(
+            json.dumps(
+                {
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "item_id": "source-new",
+                    "transcript": "New source",
+                }
+            )
+        )
+        client._handle_message(
+            json.dumps(
+                {
+                    "type": "response.text.done",
+                    "response_id": "resp-new",
+                    "text": "新译文",
+                },
+                ensure_ascii=False,
+            )
+        )
+        self.assertEqual(events[-1].source_text, "New source")
+        self.assertEqual(events[-1].translated_text, "新译文")
+
+
+class TranslationAlignerTests(unittest.TestCase):
+    def test_translation_can_complete_before_source(self) -> None:
+        clock = FakeClock()
+        aligner = TranslationAligner(clock=clock)
+
+        aligner.response_started("resp-a")
+        preview = aligner.translation_completed(
+            "resp-a",
+            "output-a",
+            "四个小时。",
+        )
+        self.assertFalse(preview[-1].event.is_final)
+
+        clock.advance(0.4)
+        outputs = aligner.source_completed(
+            "source-a",
+            "Four hours.",
+        )
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0].event.source_text, "Four hours.")
+        self.assertEqual(outputs[0].event.translated_text, "四个小时。")
+        self.assertEqual(outputs[0].event.alignment_status, "matched")
+        self.assertTrue(outputs[0].event.is_final)
+
+    def test_interleaved_segments_keep_original_order(self) -> None:
+        aligner = TranslationAligner(clock=FakeClock())
+
+        aligner.speech_started()
+        aligner.source_preview("source-a", "Sentence A")
+        aligner.speech_stopped()
+        aligner.response_started("resp-a")
+
+        aligner.speech_started()
+        aligner.source_preview("source-b", "Sentence B")
+        aligner.speech_stopped()
+        aligner.response_started("resp-b")
+
+        aligner.translation_completed("resp-a", "out-a", "译文 A")
+        aligner.translation_completed("resp-b", "out-b", "译文 B")
+        self.assertFalse(
+            any(
+                output.event.is_final
+                for output in aligner.source_completed("source-b", "Sentence B")
+            )
+        )
+        outputs = aligner.source_completed("source-a", "Sentence A")
+
+        self.assertEqual(
+            [output.event.source_text for output in outputs],
+            ["Sentence A", "Sentence B"],
+        )
+        self.assertEqual(
+            [output.event.translated_text for output in outputs],
+            ["译文 A", "译文 B"],
+        )
+
+    def test_duplicate_response_completion_is_ignored(self) -> None:
+        aligner = TranslationAligner(clock=FakeClock())
+        aligner.source_completed("source-a", "Hello")
+        first = aligner.translation_completed("resp-a", "out-a", "你好")
+        duplicate = aligner.translation_completed("resp-a", "out-a", "你好")
+
+        self.assertEqual(len(first), 1)
+        self.assertTrue(first[0].event.is_final)
+        self.assertEqual(duplicate, ())
+
+    def test_unmatched_segment_expires_without_shifting_next_pair(self) -> None:
+        clock = FakeClock()
+        aligner = TranslationAligner(timeout_seconds=5.0, clock=clock)
+        aligner.source_completed("source-a", "Untranslated sentence")
+
+        clock.advance(5.1)
+        expired = aligner.expire()
+        self.assertEqual(expired[0].event.alignment_status, "source_only")
+        self.assertEqual(expired[0].reason, "timeout")
+
+        aligner.source_completed("source-b", "Next sentence")
+        outputs = aligner.translation_completed("resp-b", "out-b", "下一句")
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0].event.source_text, "Next sentence")
+        self.assertEqual(outputs[0].event.translated_text, "下一句")
+
+    def test_flush_preserves_only_completed_side(self) -> None:
+        aligner = TranslationAligner(clock=FakeClock())
+        aligner.source_preview("source-a", "unfinished preview")
+        aligner.translation_completed("resp-a", "out-a", "最终译文")
+
+        outputs = aligner.flush("disconnect")
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0].event.source_text, "")
+        self.assertEqual(outputs[0].event.translated_text, "最终译文")
+        self.assertEqual(outputs[0].event.alignment_status, "translation_only")
+        self.assertEqual(outputs[0].reason, "disconnect")
+
+
 class ResponseParsingTests(unittest.TestCase):
     def test_text_translation_pairs_source_and_target(self) -> None:
         client, events, _, errors, _ = make_client(audio_output=False)
@@ -471,6 +632,65 @@ class ResponseParsingTests(unittest.TestCase):
         self.assertEqual(playback.audio, [pcm])  # type: ignore[union-attr]
         self.assertEqual(events[-1].source_text, "我们开始开会。")
         self.assertEqual(events[-1].translated_text, "Let's start the meeting.")
+
+    def test_text_and_audio_done_for_same_response_emit_one_final(self) -> None:
+        client, events, _, _, _ = make_client(audio_output=True)
+        client._handle_message(
+            json.dumps(
+                {
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "item_id": "source-1",
+                    "transcript": "你好",
+                },
+                ensure_ascii=False,
+            )
+        )
+        for event_type, key in (
+            ("response.text.done", "text"),
+            ("response.audio_transcript.done", "transcript"),
+        ):
+            client._handle_message(
+                json.dumps(
+                    {
+                        "type": event_type,
+                        "response_id": "resp-1",
+                        "item_id": "output-1",
+                        key: "Hello",
+                    }
+                )
+            )
+
+        finals = [event for event in events if event.is_final]
+        self.assertEqual(len(finals), 1)
+        self.assertEqual(finals[0].source_text, "你好")
+        self.assertEqual(finals[0].translated_text, "Hello")
+
+    def test_alignment_diagnostic_does_not_contain_transcript(self) -> None:
+        diagnostics = []
+        client, _, _, _, _ = make_client(diagnostics=diagnostics)
+        client._handle_message(
+            json.dumps(
+                {
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "item_id": "source-private",
+                    "transcript": "private meeting content",
+                }
+            )
+        )
+        client._handle_message(
+            json.dumps(
+                {
+                    "type": "response.text.done",
+                    "response_id": "response-private",
+                    "text": "confidential translation",
+                }
+            )
+        )
+
+        detail = diagnostics[-1].detail
+        self.assertIn("event=alignment.finalized", detail)
+        self.assertNotIn("private meeting content", detail)
+        self.assertNotIn("confidential translation", detail)
 
     def test_usage_details_are_reported(self) -> None:
         client, _, usages, _, _ = make_client()

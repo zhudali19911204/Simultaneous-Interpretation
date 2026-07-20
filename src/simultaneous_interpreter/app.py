@@ -1168,6 +1168,11 @@ class InterpreterApp:
             foreground=ui.TEXT_MUTED,
             font=(self._fonts.transcript, 10, "italic"),
         )
+        history.tag_configure(
+            "alignment_warning",
+            foreground=ui.WARNING,
+            font=(self._fonts.transcript, 10, "italic"),
+        )
         return history
 
     def _refresh_devices(self, show_errors: bool = True) -> None:
@@ -1603,6 +1608,7 @@ class InterpreterApp:
                 event.source_text,
                 event.translated_text,
                 event.is_final,
+                event.alignment_status,
             )
             self._record_turn("incoming", message.payload)
             self._show_translation(
@@ -1617,6 +1623,7 @@ class InterpreterApp:
                 event.source_text,
                 event.translated_text,
                 event.is_final,
+                event.alignment_status,
             )
             self._record_turn("outgoing", message.payload)
             self._show_translation(
@@ -1739,6 +1746,7 @@ class InterpreterApp:
                 direction=direction,
                 source_text=event.source_text,
                 translated_text=event.translated_text,
+                alignment_status=event.alignment_status,
             )
         )
         self._update_minutes_button()
@@ -1760,8 +1768,12 @@ class InterpreterApp:
             history.delete("1.0", "end")
         if event.source_text:
             history.insert("end", event.source_text + "\n", "source")
+        elif event.alignment_status == "translation_only":
+            history.insert("end", "[原文缺失]\n", "alignment_warning")
         if event.translated_text:
             history.insert("end", event.translated_text + "\n", "translation")
+        elif event.alignment_status == "source_only":
+            history.insert("end", "[译文缺失]\n", "alignment_warning")
         history.see("end")
         history.configure(state="disabled")
 

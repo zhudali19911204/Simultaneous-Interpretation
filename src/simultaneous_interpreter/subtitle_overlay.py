@@ -12,6 +12,8 @@ from . import ui_theme as ui
 INTERIM_HOLD_MS = 6_000
 MAX_SUBTITLE_CHARS = 96
 MAX_ROLLING_ITEMS = 3
+SOURCE_MISSING = "[原文缺失]"
+TRANSLATION_MISSING = "[译文缺失]"
 CHINESE_PENDING = "正在翻译…"
 ENGLISH_PENDING = "Translating…"
 
@@ -22,6 +24,7 @@ class OverlayText:
     chinese: str
     english: str
     is_final: bool
+    alignment_status: str = "matched"
 
 
 def compact_subtitle(text: str, max_chars: int = MAX_SUBTITLE_CHARS) -> str:
@@ -36,9 +39,14 @@ def make_overlay_text(
     source_text: str,
     translated_text: str,
     is_final: bool,
+    alignment_status: str = "matched",
 ) -> OverlayText:
     source = compact_subtitle(source_text)
     translated = compact_subtitle(translated_text)
+    if is_final and alignment_status == "source_only" and not translated:
+        translated = TRANSLATION_MISSING
+    elif is_final and alignment_status == "translation_only" and not source:
+        source = SOURCE_MISSING
     if direction == "incoming":
         role = "对方说"
         chinese, english = translated, source
@@ -52,6 +60,7 @@ def make_overlay_text(
         chinese=chinese or CHINESE_PENDING,
         english=english or ENGLISH_PENDING,
         is_final=is_final,
+        alignment_status=alignment_status,
     )
 
 
@@ -100,6 +109,7 @@ class RollingSubtitleBuffer:
             chinese=chinese,
             english=english,
             is_final=False,
+            alignment_status=text.alignment_status,
         )
 
     @staticmethod
@@ -203,6 +213,7 @@ class SubtitleOverlay:
         source_text: str,
         translated_text: str,
         is_final: bool,
+        alignment_status: str = "matched",
     ) -> None:
         self._buffer.update(
             make_overlay_text(
@@ -210,6 +221,7 @@ class SubtitleOverlay:
                 source_text,
                 translated_text,
                 is_final,
+                alignment_status,
             )
         )
         self._render()

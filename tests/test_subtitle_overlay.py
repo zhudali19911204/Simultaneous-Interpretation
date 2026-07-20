@@ -40,6 +40,24 @@ class SubtitleOverlayTests(unittest.TestCase):
         self.assertEqual(outgoing.english, "Translating…")
         self.assertEqual(incoming.chinese, "正在翻译…")
 
+    def test_final_unmatched_text_is_marked(self) -> None:
+        source_only = make_overlay_text(
+            "outgoing",
+            "只有原文",
+            "",
+            True,
+            "source_only",
+        )
+        translation_only = make_overlay_text(
+            "incoming",
+            "",
+            "只有译文",
+            True,
+            "translation_only",
+        )
+        self.assertEqual(source_only.english, "[译文缺失]")
+        self.assertEqual(translation_only.english, "[原文缺失]")
+
     def test_unknown_direction_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "字幕方向"):
             make_overlay_text("sideways", "source", "translation", False)

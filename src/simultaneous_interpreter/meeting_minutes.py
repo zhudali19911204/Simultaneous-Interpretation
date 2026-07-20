@@ -22,6 +22,7 @@ class MeetingTurn:
     direction: str
     source_text: str
     translated_text: str
+    alignment_status: str = "matched"
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,10 @@ def format_transcript(turns: tuple[MeetingTurn, ...] | list[MeetingTurn]) -> str
                 parts.append(f"中文原话：{source}")
             if translated:
                 parts.append(f"英文译文：{translated}")
+        if not source and turn.alignment_status == "translation_only":
+            parts.append("[原文缺失]")
+        if not translated and turn.alignment_status == "source_only":
+            parts.append("[译文缺失]")
         if len(parts) > 1:
             lines.append("｜".join(parts))
     return "\n".join(lines)

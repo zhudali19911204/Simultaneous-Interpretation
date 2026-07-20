@@ -73,6 +73,18 @@ class TranscriptTests(unittest.TestCase):
         self.assertIn("我（中文）", transcript)
         self.assertIn("I will finish testing on Thursday.", transcript)
 
+    def test_transcript_marks_unmatched_side(self) -> None:
+        turn = MeetingTurn(
+            datetime(2026, 7, 20, 9, 0, 0),
+            "incoming",
+            "Only source text",
+            "",
+            alignment_status="source_only",
+        )
+        transcript = format_transcript([turn])
+        self.assertIn("Only source text", transcript)
+        self.assertIn("[译文缺失]", transcript)
+
     def test_split_transcript_preserves_all_lines(self) -> None:
         transcript = "\n".join(f"line-{index}" for index in range(20))
         chunks = split_transcript(transcript, max_chars=35)
