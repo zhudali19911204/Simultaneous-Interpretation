@@ -26,6 +26,7 @@ from simultaneous_interpreter.qwen_backend import (  # noqa: E402
     MODEL_NAME,
     OUTPUT_SAMPLE_RATE,
     PLAYBACK_BLOCK_FRAMES,
+    QwenInterpreterSession,
     QwenLiveTranslateClient,
     TranslationAligner,
     UsageStats,
@@ -106,6 +107,38 @@ class FakeCapture:
     def stop(self) -> None:
         self.active = 0
         self.stops += 1
+
+
+class InterpreterSessionOutputTests(unittest.TestCase):
+    @patch("simultaneous_interpreter.qwen_backend.PcmPlaybackWorker")
+    @patch("simultaneous_interpreter.qwen_backend.QwenLiveTranslateClient")
+    def test_english_audio_can_be_disabled_without_stopping_text_translation(
+        self,
+        live_client,
+        playback_worker,
+    ) -> None:
+        session = QwenInterpreterSession(
+            api_key="test-key",
+            workspace_id="ws-test",
+            microphone=object(),
+            teams_loopback=object(),
+            virtual_output=None,
+            english_voice="Tina",
+            on_incoming=lambda _event: None,
+            on_outgoing=lambda _event: None,
+            on_usage=lambda _usage: None,
+            on_error=lambda _message: None,
+            use_silence_gate=True,
+            english_audio_output=False,
+        )
+
+        playback_worker.assert_not_called()
+        outgoing_options = live_client.call_args_list[0].kwargs
+        self.assertFalse(outgoing_options["audio_output"])
+        self.assertIsNone(outgoing_options["playback"])
+        session.start()
+        session.test_output()
+        session.stop()
 
 
 class ConfigurationTests(unittest.TestCase):

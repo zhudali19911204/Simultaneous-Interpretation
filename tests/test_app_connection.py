@@ -21,6 +21,14 @@ class FakeButton:
         self.state = options.get("state", self.state)
 
 
+class FakeVar:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def get(self) -> str:
+        return self.value
+
+
 class FakeOverlay:
     def __init__(self) -> None:
         self.calls = []
@@ -38,6 +46,7 @@ def make_app_shell():
     app._connection_states = {}
     app._had_connection_interruption = False
     app._meeting_turns = [object()]
+    app.output_var = FakeVar("CABLE Input")
     app.test_button = FakeButton()
     app._subtitle_overlay = FakeOverlay()
     status_calls = []
@@ -46,6 +55,19 @@ def make_app_shell():
 
 
 class AppConnectionStatusTests(unittest.TestCase):
+    def test_disabled_english_audio_keeps_test_output_disabled(self) -> None:
+        app, status_calls = make_app_shell()
+        app.output_var = FakeVar(app.OUTPUT_DISABLED_LABEL)
+
+        app._handle_connection_status(ConnectionStatus("incoming", "connected"))
+        app._handle_connection_status(ConnectionStatus("outgoing", "connected"))
+
+        self.assertEqual(app.test_button.state, "disabled")
+        self.assertEqual(
+            status_calls[-1][0][0],
+            "同传运行中（英文语音已关闭）",
+        )
+
     def test_meeting_assistant_is_created_only_when_opened(self) -> None:
         app = InterpreterApp.__new__(InterpreterApp)
         app._meeting_assistant = None

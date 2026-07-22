@@ -10,7 +10,10 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
+from PIL import ImageTk
+
 from .audio_devices import AudioDeviceCatalog, AudioDeviceChoice
+from .brand_logo import render_brand_logo
 from .credential_store import (
     clear_credentials,
     clear_minutes_api_key,
@@ -91,6 +94,7 @@ class _GeneratedMinutes:
 
 class InterpreterApp:
     POLL_MS = 50
+    OUTPUT_DISABLED_LABEL = "关闭英文语音输出（保留英文文字）"
     VOICE_CHOICES = (
         ("Tina（女声·温暖）", "Tina"),
         ("Cindy（女声·甜美）", "Cindy"),
@@ -278,8 +282,10 @@ class InterpreterApp:
         header.grid(row=0, column=0, sticky="ew", pady=(0, ui.SPACE_3))
         header.columnconfigure(0, weight=1)
 
-        title_group = ttk.Frame(header, style="Background.TFrame")
-        title_group.grid(row=0, column=0, sticky="w")
+        brand_group = ttk.Frame(header, style="Background.TFrame")
+        brand_group.grid(row=0, column=0, sticky="w")
+        title_group = ttk.Frame(brand_group, style="Background.TFrame")
+        title_group.pack(side="left")
         ttk.Label(
             title_group,
             text="Teams 中英同声翻译助手",
@@ -290,6 +296,17 @@ class InterpreterApp:
             text="对方英文 → 你看中文   ·   你说中文 → 对方听英文",
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(ui.SPACE_1, 0))
+        self._brand_logo_photo = ImageTk.PhotoImage(
+            render_brand_logo(),
+            master=self.root,
+        )
+        tk.Label(
+            brand_group,
+            image=self._brand_logo_photo,
+            background=ui.BACKGROUND,
+            borderwidth=0,
+            highlightthickness=0,
+        ).pack(side="left", padx=(ui.SPACE_3, 0))
 
         header_actions = ttk.Frame(header, style="Background.TFrame")
         header_actions.grid(row=0, column=1, sticky="e")
@@ -370,6 +387,10 @@ class InterpreterApp:
             textvariable=self.output_var,
             state="readonly",
         )
+        self.output_combo.bind(
+            "<<ComboboxSelected>>",
+            self._on_output_selection_changed,
+        )
         self.voice_combo = ttk.Combobox(
             self.audio_content,
             textvariable=self.voice_var,
@@ -396,7 +417,7 @@ class InterpreterApp:
             (
                 ttk.Label(
                     self.audio_content,
-                    text="英文输出（CABLE Input）",
+                    text="英文语音输出（可关闭）",
                     style="Surface.TLabel",
                 ),
                 self.output_combo,
@@ -1448,10 +1469,24 @@ class InterpreterApp:
                 "loopback", self.loopback_combo, self.loopback_var,
                 self._catalog.loopbacks, self._catalog.default_loopback_label,
             )
+            available_output_labels = {
+                choice.label for choice in self._catalog.outputs
+            }
+            current_output = self.output_var.get()
+            preferred_output = (
+                current_output
+                if current_output in available_output_labels
+                else self.OUTPUT_DISABLED_LABEL
+            )
             self._set_combo(
                 "output", self.output_combo, self.output_var,
-                self._catalog.outputs, self._catalog.default_output_label,
+                [
+                    AudioDeviceChoice(self.OUTPUT_DISABLED_LABEL, None),
+                    *self._catalog.outputs,
+                ],
+                preferred_output,
             )
+            self._sync_output_controls()
             if show_errors:
                 self._set_status("音频设备已刷新", "info")
         except Exception as exc:
@@ -1482,6 +1517,29 @@ class InterpreterApp:
         if choice is None:
             raise ValueError(f"没有选择有效的{group}设备")
         return choice.device
+
+    def _english_audio_output_enabled(self) -> bool:
+        return self.output_var.get() != self.OUTPUT_DISABLED_LABEL
+
+    def _running_status_text(self) -> str:
+        if self._english_audio_output_enabled():
+            return "同传运行中"
+        return "同传运行中（英文语音已关闭）"
+
+    def _sync_output_controls(self) -> None:
+        enabled = self._english_audio_output_enabled()
+        self.voice_combo.configure(
+            state="readonly" if enabled and self._state == "idle" else "disabled"
+        )
+        if not enabled and hasattr(self, "test_button"):
+            self.test_button.configure(state="disabled")
+
+    def _on_output_selection_changed(self, _event: object = None) -> None:
+        self._sync_output_controls()
+        if self._english_audio_output_enabled():
+            self._set_status("英文语音输出已启用", "info")
+        else:
+            self._set_status("英文语音输出已关闭；英文文字翻译仍会保留", "info")
 
     def _interpreter_provider_id(self) -> str:
         preset = INTERPRETER_BY_LABEL.get(self.interpreter_provider_var.get())
@@ -1790,7 +1848,12 @@ class InterpreterApp:
             build_api_url(workspace_id, interpreter_model, websocket_url)
             microphone = self._selected_device("microphone", self.microphone_var.get())
             loopback = self._selected_device("loopback", self.loopback_var.get())
-            output = self._selected_device("output", self.output_var.get())
+            english_audio_output = self._english_audio_output_enabled()
+            output = (
+                self._selected_device("output", self.output_var.get())
+                if english_audio_output
+                else None
+            )
         except ValueError as exc:
             messagebox.showwarning("同传配置未就绪", str(exc))
             return
@@ -1807,6 +1870,7 @@ class InterpreterApp:
             "microphone": microphone,
             "teams_loopback": loopback,
             "virtual_output": output,
+            "english_audio_output": english_audio_output,
             "english_voice": self.VOICE_API_NAMES[self.voice_var.get()],
             "on_incoming": lambda event: self._post("incoming", event),
             "on_outgoing": lambda event: self._post("outgoing", event),
@@ -1854,7 +1918,11 @@ class InterpreterApp:
         self._post("stopped")
 
     def _test_output(self) -> None:
-        if self._state == "running" and self._session:
+        if (
+            self._state == "running"
+            and self._session
+            and self._english_audio_output_enabled()
+        ):
             self._session.test_output()
             self._set_status("已向英文输出设备发送测试音", "info")
 
@@ -2048,11 +2116,17 @@ class InterpreterApp:
             if self._meeting_started_at is None:
                 self._meeting_started_at = datetime.now()
             self._meeting_ended_at = None
-            self._set_status("同传运行中", "running", busy=False)
+            self._set_status(self._running_status_text(), "running", busy=False)
             self._subtitle_overlay.clear_connection_notice()
             self._set_audio_panel_expanded(False)
             self.stop_button.configure(state="normal")
-            self.test_button.configure(state="normal")
+            self.test_button.configure(
+                state=(
+                    "normal"
+                    if self._english_audio_output_enabled()
+                    else "disabled"
+                )
+            )
         elif message.kind == "start_failed":
             self._state = "idle"
             self._session = None
@@ -2153,7 +2227,11 @@ class InterpreterApp:
             self.test_button.configure(
                 state=(
                     "normal"
-                    if outgoing and outgoing.state == "connected"
+                    if (
+                        self._english_audio_output_enabled()
+                        and outgoing
+                        and outgoing.state == "connected"
+                    )
                     else "disabled"
                 )
             )
@@ -2202,7 +2280,7 @@ class InterpreterApp:
             for direction in ("outgoing", "incoming")
         )
         if both_connected:
-            self._set_status("同传运行中", "running", busy=False)
+            self._set_status(self._running_status_text(), "running", busy=False)
             if self._had_connection_interruption:
                 self._subtitle_overlay.set_connection_notice(
                     "连接已恢复",
@@ -2262,15 +2340,27 @@ class InterpreterApp:
             self.microphone_combo,
             self.loopback_combo,
             self.output_combo,
-            self.voice_combo,
         ):
             combo.configure(state=combo_state)
+        self.voice_combo.configure(
+            state=(
+                "readonly"
+                if not running and self._english_audio_output_enabled()
+                else "disabled"
+            )
+        )
         self.start_button.configure(state="disabled" if running else "normal")
         self.refresh_button.configure(state="disabled" if running else "normal")
         self.settings_button.configure(state="disabled" if running else "normal")
         self._sync_voice_choices()
         self.stop_button.configure(state="normal" if running and ready else "disabled")
-        self.test_button.configure(state="normal" if running and ready else "disabled")
+        self.test_button.configure(
+            state=(
+                "normal"
+                if running and ready and self._english_audio_output_enabled()
+                else "disabled"
+            )
+        )
         self._update_minutes_button()
 
     def _update_minutes_button(self) -> None:

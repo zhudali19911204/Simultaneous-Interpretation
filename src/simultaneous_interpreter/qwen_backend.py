@@ -1321,7 +1321,7 @@ class QwenInterpreterSession:
         websocket_url: str = "",
         microphone: Any,
         teams_loopback: Any,
-        virtual_output: Any,
+        virtual_output: Any | None,
         english_voice: str,
         on_incoming: TranslationCallback,
         on_outgoing: TranslationCallback,
@@ -1330,12 +1330,19 @@ class QwenInterpreterSession:
         on_connection_status: ConnectionStatusCallback | None = None,
         on_diagnostic: ConnectionStatusCallback | None = None,
         use_silence_gate: bool,
+        english_audio_output: bool = True,
     ) -> None:
         self._on_usage = on_usage
         self._usage = UsageStats()
         self._usage_lock = threading.Lock()
         attempt_limiter = ConnectionAttemptLimiter()
-        self._playback = PcmPlaybackWorker(virtual_output, on_error)
+        if english_audio_output and virtual_output is None:
+            raise ValueError("启用英文语音输出时必须选择输出设备")
+        self._playback = (
+            PcmPlaybackWorker(virtual_output, on_error)
+            if english_audio_output
+            else None
+        )
         self._outgoing = QwenLiveTranslateClient(
             api_key=api_key,
             workspace_id=workspace_id,
@@ -1343,7 +1350,7 @@ class QwenInterpreterSession:
             websocket_url=websocket_url,
             source_language="zh",
             target_language="en",
-            audio_output=True,
+            audio_output=english_audio_output,
             input_device=microphone,
             voice_name=english_voice,
             playback=self._playback,
@@ -1380,7 +1387,8 @@ class QwenInterpreterSession:
 
     def start(self) -> None:
         try:
-            self._playback.start()
+            if self._playback is not None:
+                self._playback.start()
             self._outgoing.start()
             self._incoming.start()
             self._started = True
@@ -1390,6 +1398,8 @@ class QwenInterpreterSession:
 
     def stop(self) -> None:
         for component in (self._incoming, self._outgoing, self._playback):
+            if component is None:
+                continue
             try:
                 component.stop()
             except Exception:
@@ -1397,7 +1407,7 @@ class QwenInterpreterSession:
         self._started = False
 
     def test_output(self) -> None:
-        if self._started:
+        if self._started and self._playback is not None:
             self._playback.play_test_tone()
 
     def _add_usage(self, stats: UsageStats) -> None:

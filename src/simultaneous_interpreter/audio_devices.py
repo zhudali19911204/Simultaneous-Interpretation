@@ -124,4 +124,3 @@ class AudioDeviceCatalog:
                 ):
                     return choice.label
         return choices[0].label if choices else ""
-
