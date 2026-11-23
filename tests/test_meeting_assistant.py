@@ -24,6 +24,9 @@ from simultaneous_interpreter.meeting_assistant import (  # noqa: E402
     split_transcript_by_chars,
 )
 from simultaneous_interpreter.meeting_minutes import MeetingTurn  # noqa: E402
+from simultaneous_interpreter.meeting_assistant_window import (  # noqa: E402
+    MeetingAssistantWindow,
+)
 
 
 class FakeResponse:
@@ -47,6 +50,55 @@ class FakeResponse:
 
     def read(self) -> bytes:
         return self._payload
+
+
+class TimelineNavigationTests(unittest.TestCase):
+    def test_show_timeline_at_selects_timeline_and_requests_focus(self) -> None:
+        assistant = MeetingAssistantWindow.__new__(MeetingAssistantWindow)
+
+        class FakeWindow:
+            @staticmethod
+            def winfo_exists() -> bool:
+                return True
+
+        class FakeVar:
+            def __init__(self) -> None:
+                self.value = ""
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+        class FakeNotebook:
+            def __init__(self) -> None:
+                self.selected = None
+
+            def select(self, tab) -> None:
+                self.selected = tab
+
+        assistant._window = FakeWindow()
+        assistant._search_var = FakeVar()
+        assistant._direction_var = FakeVar()
+        assistant._notebook = FakeNotebook()
+        assistant._timeline_tab = object()
+        assistant._timeline_focus_timestamp = None
+        calls = []
+        assistant.show = lambda: calls.append("show")
+        assistant._sync_snapshot = lambda: calls.append("sync")
+        assistant._render_timeline = lambda: calls.append("render")
+
+        assistant.show_timeline_at("09:42:18")
+
+        self.assertEqual(
+            calls,
+            ["show", "sync", "render"],
+        )
+        self.assertEqual(assistant._search_var.value, "")
+        self.assertEqual(assistant._direction_var.value, "全部")
+        self.assertEqual(assistant._timeline_focus_timestamp, "09:42:18")
+        self.assertIs(
+            assistant._notebook.selected,
+            assistant._timeline_tab,
+        )
 
 
 def make_turn(

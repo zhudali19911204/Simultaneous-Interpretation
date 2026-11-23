@@ -106,6 +106,45 @@ class AppConnectionStatusTests(unittest.TestCase):
         self.assertEqual(app.silence_gate_check.state, "normal")
         self.assertEqual(app.silence_gate_check.text, "省流量静音门控")
 
+    def test_minutes_template_is_locked_only_while_generating(self) -> None:
+        app = InterpreterApp.__new__(InterpreterApp)
+        app._state = "idle"
+        app._meeting_turns = [object()]
+        app._minutes_generating = False
+        app.minutes_button = FakeButton()
+        app.minutes_template_combo = FakeButton()
+
+        app._update_minutes_button()
+
+        self.assertEqual(app.minutes_button.state, "normal")
+        self.assertEqual(app.minutes_template_combo.state, "readonly")
+
+        app._minutes_generating = True
+        app._update_minutes_button()
+
+        self.assertEqual(app.minutes_button.state, "disabled")
+        self.assertEqual(app.minutes_template_combo.state, "disabled")
+
+    def test_minutes_citation_routes_to_assistant_timeline(self) -> None:
+        app = InterpreterApp.__new__(InterpreterApp)
+
+        class FakeAssistant:
+            def __init__(self) -> None:
+                self.timestamps = []
+
+            def show_timeline_at(self, timestamp: str) -> None:
+                self.timestamps.append(timestamp)
+
+        assistant = FakeAssistant()
+        app._meeting_assistant = assistant
+        show_calls = []
+        app._show_meeting_assistant = lambda: show_calls.append(True)
+
+        app._open_minutes_citation("09:42:18")
+
+        self.assertEqual(show_calls, [True])
+        self.assertEqual(assistant.timestamps, ["09:42:18"])
+
     def test_disabled_english_audio_keeps_test_output_disabled(self) -> None:
         app, status_calls = make_app_shell()
         app.output_var = FakeVar(app.OUTPUT_DISABLED_LABEL)

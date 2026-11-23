@@ -59,6 +59,7 @@ New-Item -ItemType Directory -Path $AppDir -Force | Out-Null
 Copy-Item -Path (Join-Path $DistDir "TeamsInterpreter\*") -Destination $AppDir -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $ProjectRoot "packaging\Install.cmd") -Destination $PackageDir
 Copy-Item -LiteralPath (Join-Path $ProjectRoot "packaging\User-Guide.txt") -Destination $PackageDir
+Copy-Item -LiteralPath (Join-Path $ProjectRoot "USER_GUIDE.md") -Destination $PackageDir
 
 $Executable = Join-Path $AppDir "TeamsInterpreter.exe"
 $Hash = (Get-FileHash -LiteralPath $Executable -Algorithm SHA256).Hash

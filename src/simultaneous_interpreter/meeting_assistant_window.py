@@ -145,6 +145,7 @@ class MeetingAssistantWindow:
         self._visual_preview_message = "尚无共享画面分析"
         self._visual_preview_after_id: str | None = None
         self._visual_progress_active = False
+        self._timeline_focus_timestamp: str | None = None
 
     @property
     def visible(self) -> bool:
@@ -162,6 +163,21 @@ class MeetingAssistantWindow:
         self._sync_snapshot()
         self._render_all()
         self._schedule_tick()
+
+    def show_timeline_at(self, timestamp: str) -> None:
+        try:
+            datetime.strptime(timestamp, "%H:%M:%S")
+        except ValueError:
+            return
+        self.show()
+        if not self.visible:
+            return
+        self._sync_snapshot()
+        self._timeline_focus_timestamp = timestamp
+        self._search_var.set("")
+        self._direction_var.set("全部")
+        self._notebook.select(self._timeline_tab)
+        self._render_timeline()
 
     def destroy(self) -> None:
         self._close_window()
@@ -220,6 +236,7 @@ class MeetingAssistantWindow:
         self._status_label.grid(row=1, column=0, sticky="ew", pady=(0, ui.SPACE_2))
 
         notebook = ttk.Notebook(outer)
+        self._notebook = notebook
         notebook.grid(row=2, column=0, sticky="nsew")
         insight_tab = ttk.Frame(notebook, style="Surface.TFrame", padding=ui.SPACE_3)
         question_tab = ttk.Frame(notebook, style="Surface.TFrame", padding=ui.SPACE_3)
@@ -229,6 +246,7 @@ class MeetingAssistantWindow:
         notebook.add(question_tab, text="会中问答")
         notebook.add(timeline_tab, text="完整时间线")
         notebook.add(visual_tab, text="共享画面")
+        self._timeline_tab = timeline_tab
         self._build_insight_tab(insight_tab)
         self._build_question_tab(question_tab)
         self._build_timeline_tab(timeline_tab)
@@ -347,6 +365,11 @@ class MeetingAssistantWindow:
             font=(self._fonts.transcript, 11),
             spacing1=8,
             spacing3=5,
+        )
+        self._timeline_text.tag_configure(
+            "timeline_focus",
+            background=ui.SURFACE_ELEVATED,
+            foreground=ui.TEXT_PRIMARY,
         )
         self._timeline_text.tag_configure(
             "match",
@@ -918,12 +941,21 @@ class MeetingAssistantWindow:
         if not turns:
             message = "当前没有匹配的会议记录。" if self._snapshot else "会议字幕将在这里按时间显示。"
             text.insert("end", message + "\n", "incoming")
+        focus_start = ""
         for turn in turns:
+            line_start = text.index("end-1c")
             text.insert(
                 "end",
                 format_assistant_turn(turn) + "\n",
                 turn.direction,
             )
+            if (
+                not focus_start
+                and self._timeline_focus_timestamp
+                and turn.recorded_at.strftime("%H:%M:%S")
+                == self._timeline_focus_timestamp
+            ):
+                focus_start = line_start
         query = self._search_var.get().strip()
         if query:
             start = "1.0"
@@ -934,6 +966,17 @@ class MeetingAssistantWindow:
                 end = f"{match}+{len(query)}c"
                 text.tag_add("match", match, end)
                 start = end
+        if focus_start:
+            text.tag_add("timeline_focus", focus_start, f"{focus_start} lineend")
+            text.see(focus_start)
+            self._set_status(
+                f"已定位到 {self._timeline_focus_timestamp} 的会议记录"
+            )
+        elif self._timeline_focus_timestamp:
+            self._set_status(
+                f"未找到 {self._timeline_focus_timestamp} 的会议记录",
+                error=True,
+            )
         text.configure(state="disabled")
 
     def _render_visual_timeline(self, *, select_latest: bool = False) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 import tkinter as tk
 from collections import OrderedDict
@@ -27,10 +28,15 @@ from .credential_store import (
 )
 from .diagnostics import ConnectionDiagnosticLogger
 from .meeting_minutes import (
+    DEFAULT_MINUTES_TEMPLATE,
     DEFAULT_MINUTES_MODEL,
+    MINUTES_QUALITY_FALLBACK,
+    MINUTES_TEMPLATE_BY_LABEL,
+    MINUTES_TEMPLATE_LABELS,
     MeetingTurn,
     MinutesResult,
     OpenAICompatibleMeetingMinutesClient,
+    minutes_template_label,
     normalize_model_name,
 )
 from .minutes_export import (
@@ -275,6 +281,9 @@ class InterpreterApp:
             or os.getenv("QWEN_MINUTES_MODEL", "")
             or saved_settings.meeting_minutes_model
             or DEFAULT_MINUTES_MODEL
+        )
+        self.minutes_template_var = tk.StringVar(
+            value=minutes_template_label(DEFAULT_MINUTES_TEMPLATE)
         )
         self.status_var = tk.StringVar(value="尚未启动")
         self.usage_var = tk.StringVar(value="Token：0")
@@ -579,6 +588,19 @@ class InterpreterApp:
             state="disabled",
         )
         self.minutes_button.pack(side="right", padx=(0, ui.SPACE_2))
+        self.minutes_template_combo = ttk.Combobox(
+            footer_actions,
+            textvariable=self.minutes_template_var,
+            values=MINUTES_TEMPLATE_LABELS,
+            state="readonly",
+            width=9,
+        )
+        self.minutes_template_combo.pack(side="right", padx=(0, ui.SPACE_2))
+        ttk.Label(
+            footer_actions,
+            text="纪要模板",
+            style="Subtitle.TLabel",
+        ).pack(side="right", padx=(0, ui.SPACE_2))
         self.meeting_assistant_button = ttk.Button(
             footer_actions,
             text="会议助手",
@@ -1226,7 +1248,7 @@ class InterpreterApp:
         )
         ttk.Label(
             tab,
-            text='可选，例如 {"temperature": 0.2}；必须是 JSON 对象。',
+            text='可选，例如 {"top_p": 0.8}；必须是 JSON 对象。',
             style="Helper.TLabel",
         ).grid(
             row=9,
@@ -2096,6 +2118,11 @@ class InterpreterApp:
             return
         try:
             provider_id = self._minutes_provider_id()
+            template_id = MINUTES_TEMPLATE_BY_LABEL.get(
+                self.minutes_template_var.get()
+            )
+            if template_id is None:
+                raise ValueError("请选择有效的会议纪要模板")
             api_key = self._resolved_minutes_api_key(provider_id)
             minutes_model = normalize_model_name(self.minutes_model_var.get())
             api_url = resolve_minutes_url(
@@ -2140,6 +2167,7 @@ class InterpreterApp:
                 ended_at,
                 visual_context,
                 minutes_visual_moments,
+                template_id,
             ),
             name="meeting-minutes",
             daemon=True,
@@ -2157,6 +2185,7 @@ class InterpreterApp:
         ended_at: datetime,
         visual_context: str,
         visual_moments: tuple[VisualMoment, ...],
+        template_id: str,
     ) -> None:
         try:
             client = OpenAICompatibleMeetingMinutesClient(
@@ -2171,6 +2200,7 @@ class InterpreterApp:
                 started_at,
                 ended_at,
                 visual_context,
+                template_id,
             )
             self._post(
                 "minutes_ready",
@@ -2285,15 +2315,26 @@ class InterpreterApp:
                 result.markdown,
                 generated.visual_moments
             )
+            template_label = minutes_template_label(result.template)
+            quality_text = (
+                "基础生成（事实校验未完成）"
+                if result.quality_status == MINUTES_QUALITY_FALLBACK
+                else "事实校验完成"
+            )
             self._set_status(
-                "会议纪要已生成："
+                f"{template_label}已生成 · {quality_text}："
                 f"输入 {result.input_tokens} / 输出 {result.output_tokens} Token",
-                "info",
+                (
+                    "warning"
+                    if result.quality_status == MINUTES_QUALITY_FALLBACK
+                    or result.quality_warnings
+                    else "info"
+                ),
                 busy=False,
             )
             self.clear_history_button.configure(state="normal")
             self._update_minutes_button()
-            self._show_minutes_window(result.markdown)
+            self._show_minutes_window(result)
         elif message.kind == "minutes_failed":
             self._minutes_generating = False
             self._set_status("会议纪要生成失败", "error", busy=False)
@@ -2523,6 +2564,9 @@ class InterpreterApp:
             text="正在生成会议纪要…" if self._minutes_generating else "生成 AI 会议纪要",
             state="normal" if enabled else "disabled",
         )
+        self.minutes_template_combo.configure(
+            state="disabled" if self._minutes_generating else "readonly"
+        )
 
     def _toggle_topmost(self) -> None:
         self.root.attributes("-topmost", self.always_on_top_var.get())
@@ -2565,7 +2609,8 @@ class InterpreterApp:
             self._meeting_assistant.records_cleared()
         self._update_minutes_button()
 
-    def _show_minutes_window(self, markdown: str) -> None:
+    def _show_minutes_window(self, result: MinutesResult) -> None:
+        markdown = result.markdown
         if self._minutes_window and self._minutes_window.winfo_exists():
             self._minutes_window.destroy()
         self._minutes_save_button = None
@@ -2587,7 +2632,6 @@ class InterpreterApp:
         )
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(1, weight=1)
 
         toolbar = ttk.Frame(
             outer,
@@ -2605,6 +2649,19 @@ class InterpreterApp:
         ttk.Label(
             title_group,
             text=self._meeting_time_summary(),
+            style="Helper.TLabel",
+        ).pack(anchor="w", pady=(ui.SPACE_1, 0))
+        quality_label = (
+            "基础生成 · 事实校验未完成"
+            if result.quality_status == MINUTES_QUALITY_FALLBACK
+            else "两阶段事实校验完成"
+        )
+        ttk.Label(
+            title_group,
+            text=(
+                f"{minutes_template_label(result.template)} · {quality_label}"
+                f" · 输入 {result.input_tokens} / 输出 {result.output_tokens} Token"
+            ),
             style="Helper.TLabel",
         ).pack(anchor="w", pady=(ui.SPACE_1, 0))
         exportable_count = sum(
@@ -2645,8 +2702,33 @@ class InterpreterApp:
             command=lambda: self._copy_minutes(markdown),
         ).pack(side="right", padx=(0, ui.SPACE_2))
 
+        content_row = 1
+        if result.quality_warnings:
+            warning_text = "\n".join(
+                f"• {warning}" for warning in result.quality_warnings
+            )
+            warning = tk.Label(
+                outer,
+                text=warning_text,
+                bg=ui.WARNING_SURFACE,
+                fg=ui.WARNING,
+                anchor="w",
+                justify="left",
+                padx=ui.SPACE_3,
+                pady=ui.SPACE_2,
+                wraplength=820,
+                font=(self._fonts.ui, 9),
+            )
+            warning.grid(
+                row=1,
+                column=0,
+                sticky="ew",
+                pady=(0, ui.SPACE_3),
+            )
+            content_row = 2
+        outer.rowconfigure(content_row, weight=1)
         text_frame = ttk.Frame(outer, style="Card.TFrame", padding=1)
-        text_frame.grid(row=1, column=0, sticky="nsew")
+        text_frame.grid(row=content_row, column=0, sticky="nsew")
         text_frame.columnconfigure(0, weight=1)
         text_frame.rowconfigure(0, weight=1)
         text = tk.Text(
@@ -2738,6 +2820,42 @@ class InterpreterApp:
                 text.insert("end", f"• {block.text}\n", "bullet")
             else:
                 text.insert("end", block.text + "\n", block.kind)
+        rendered = text.get("1.0", "end-1c")
+        for index, match in enumerate(
+            re.finditer(r"\[(\d{2}:\d{2}:\d{2})\]", rendered)
+        ):
+            timestamp = match.group(1)
+            tag = f"minutes_citation_{index}"
+            start = f"1.0+{match.start()}c"
+            end = f"1.0+{match.end()}c"
+            text.tag_add(tag, start, end)
+            text.tag_configure(
+                tag,
+                foreground=ui.FOCUS,
+                underline=True,
+            )
+            text.tag_bind(
+                tag,
+                "<Button-1>",
+                lambda _event, value=timestamp: self._open_minutes_citation(
+                    value
+                ),
+            )
+            text.tag_bind(
+                tag,
+                "<Enter>",
+                lambda _event, widget=text: widget.configure(cursor="hand2"),
+            )
+            text.tag_bind(
+                tag,
+                "<Leave>",
+                lambda _event, widget=text: widget.configure(cursor="xterm"),
+            )
+
+    def _open_minutes_citation(self, timestamp: str) -> None:
+        self._show_meeting_assistant()
+        if self._meeting_assistant is not None:
+            self._meeting_assistant.show_timeline_at(timestamp)
 
     def _copy_minutes(self, markdown: str) -> None:
         self.root.clipboard_clear()
