@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "baoyu-comic": {
+      "source": "jimliu/baoyu-skills",
+      "sourceType": "github",
+      "skillPath": "skills/baoyu-comic/SKILL.md",
+      "computedHash": "594cd1430487a7a295297fcf5bbab6a889fc5a751d89a088ae058b79274de8d3"
+    },
+    "storyboard-manager": {
+      "source": "ailabs-393/ai-labs-claude-skills",
+      "sourceType": "github",
+      "skillPath": "packages/skills/storyboard-manager/SKILL.md",
+      "computedHash": "8f53650036fdadceaf0472d849494d216893e6e787f1e2eb1f426b2185c363b7"
+    }
+  }
+}

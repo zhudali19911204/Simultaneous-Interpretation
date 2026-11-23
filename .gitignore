@@ -12,3 +12,4 @@ config.json
 /build/
 /dist/
 /release/
+/project_presentation_versions/*.pptx
