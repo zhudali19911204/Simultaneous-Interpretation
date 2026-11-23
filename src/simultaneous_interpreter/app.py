@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import os
-import queue
 import threading
 import tkinter as tk
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -60,11 +60,15 @@ from .provider_config import (
 )
 from .qwen_backend import (
     ConnectionStatus,
+    QWEN35_MODEL_NAME,
+    QWEN38_MODEL_NAME,
     QwenInterpreterSession,
     TranslationEvent,
     UsageStats,
     build_api_url,
     normalize_realtime_model_name,
+    supports_qwen38_fast_subtitles,
+    uses_qwen38_protocol,
 )
 from .settings_store import AppSettings, load_settings, save_settings
 from .subtitle_overlay import SubtitleOverlay
@@ -86,6 +90,38 @@ class UiMessage:
     payload: Any = None
 
 
+class UiEventQueue:
+    """Replace unread subtitle snapshots while preserving final and control events."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._messages: OrderedDict[
+            int | tuple[int, str, str], UiMessage
+        ] = OrderedDict()
+        self._barrier = 0
+
+    def put(self, message: UiMessage) -> None:
+        with self._lock:
+            if (
+                message.kind in {"incoming", "outgoing"}
+                and not message.payload.is_final
+            ):
+                # Updating this key keeps the segment at its first unread position.
+                key = (self._barrier, message.kind, message.payload.segment_id)
+                self._messages[key] = message
+            else:
+                # Later snapshots cannot overwrite one preceding this event.
+                self._barrier += 1
+                self._messages[self._barrier] = message
+
+    def take(self, limit: int) -> list[UiMessage]:
+        with self._lock:
+            return [
+                self._messages.popitem(last=False)[1]
+                for _ in range(min(limit, len(self._messages)))
+            ]
+
+
 @dataclass(frozen=True)
 class _GeneratedMinutes:
     result: MinutesResult
@@ -93,7 +129,8 @@ class _GeneratedMinutes:
 
 
 class InterpreterApp:
-    POLL_MS = 50
+    POLL_MS = 20
+    MAX_EVENTS_PER_POLL = 128
     OUTPUT_DISABLED_LABEL = "关闭英文语音输出（保留英文文字）"
     VOICE_CHOICES = (
         ("Tina（女声·温暖）", "Tina"),
@@ -138,12 +175,12 @@ class InterpreterApp:
         saved_settings = load_settings()
 
         self.root = tk.Tk()
-        self.root.title("Teams 中英同声翻译助手")
+        self.root.title("Teams 中英同声翻译助手 · 流式字幕")
         self.root.geometry("1120x780")
         self.root.minsize(820, 640)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self._events: queue.Queue[UiMessage] = queue.Queue()
+        self._events = UiEventQueue()
         self._session: QwenInterpreterSession | None = None
         self._state = "idle"
         self._connection_states: dict[str, ConnectionStatus] = {}
@@ -166,7 +203,7 @@ class InterpreterApp:
         self._minutes_save_button: ttk.Button | None = None
         self._minutes_export_hint_var: tk.StringVar | None = None
         self._settings_window: tk.Toplevel | None = None
-        self._settings_snapshot: dict[str, str] | None = None
+        self._settings_snapshot: dict[str, str | bool] | None = None
         self._settings_error_var: tk.StringVar | None = None
         self._settings_focus_targets: dict[str, tk.Widget] = {}
         self._audio_panel_expanded = True
@@ -195,6 +232,10 @@ class InterpreterApp:
             value=os.getenv("INTERPRETER_WEBSOCKET_URL", "")
             or saved_settings.interpreter_websocket_url
         )
+        self.qwen38_fast_subtitles_var = tk.BooleanVar(
+            value=saved_settings.qwen38_fast_subtitles
+        )
+        self.interpreter_model_var.trace_add("write", self._sync_fast_subtitle_control)
         self.minutes_provider_var = tk.StringVar(value=minutes_preset.label)
         self.minutes_api_key_var = tk.StringVar(
             value=os.getenv("MINUTES_API_KEY", "") or saved_minutes_api_key
@@ -497,7 +538,7 @@ class InterpreterApp:
             self._build_transcript_card(
                 self.panes,
                 role="对方",
-                title="英文 → 中文字幕",
+                title="英文 → 中文 · 双语字幕",
                 interim_var=self.incoming_interim_var,
                 role_style="Incoming.Role.TLabel",
             )
@@ -506,7 +547,7 @@ class InterpreterApp:
             self._build_transcript_card(
                 self.panes,
                 role="我",
-                title="中文 → 英文语音",
+                title="中文 → 英文 · 双语字幕 / 语音",
                 interim_var=self.outgoing_interim_var,
                 role_style="Outgoing.Role.TLabel",
             )
@@ -575,7 +616,7 @@ class InterpreterApp:
         interim = ttk.Label(
             card,
             textvariable=interim_var,
-            style="Interim.TLabel",
+            style="Helper.TLabel",
             width=1,
             wraplength=480,
             justify="left",
@@ -588,7 +629,14 @@ class InterpreterApp:
     def _reset_history(history: tk.Text) -> None:
         history.configure(state="normal")
         history.delete("1.0", "end")
-        history.insert("1.0", "最终译文将在这里持续记录。", "placeholder")
+        for tag in history.tag_names():
+            if tag.startswith(("live_segment:", "live_source:", "live_translation:")):
+                history.tag_delete(tag)
+        history.insert(
+            "1.0",
+            "中英文将在这里实时显示，原文在上、译文在下。",
+            "placeholder",
+        )
         history.configure(state="disabled")
 
     def _toggle_audio_panel(self) -> None:
@@ -752,10 +800,11 @@ class InterpreterApp:
             self.operation_progress.grid()
             self.operation_progress.start(12)
 
-    def _settings_variables(self) -> dict[str, tk.StringVar]:
+    def _settings_variables(self) -> dict[str, tk.Variable]:
         return {
             "interpreter_provider": self.interpreter_provider_var,
             "interpreter_model": self.interpreter_model_var,
+            "qwen38_fast_subtitles": self.qwen38_fast_subtitles_var,
             "interpreter_api_key": self.api_key_var,
             "workspace_id": self.workspace_id_var,
             "interpreter_websocket_url": self.interpreter_websocket_url_var,
@@ -929,7 +978,7 @@ class InterpreterApp:
         self.interpreter_model_combo = ttk.Combobox(
             tab,
             textvariable=self.interpreter_model_var,
-            values=("qwen3.5-livetranslate-flash-realtime",),
+            values=(QWEN38_MODEL_NAME, QWEN35_MODEL_NAME),
         )
         self.interpreter_model_combo.grid(
             row=2,
@@ -1043,6 +1092,21 @@ class InterpreterApp:
             self.interpreter_websocket_url_entry,
             self.interpreter_websocket_url_helper,
         )
+        self.fast_subtitle_options = ttk.Frame(tab, style="Surface.TFrame")
+        self.fast_subtitle_options.grid(
+            row=10, column=0, columnspan=2, sticky="w", pady=(ui.SPACE_3, 0),
+        )
+        ttk.Checkbutton(
+            self.fast_subtitle_options,
+            text="按停顿快速断句",
+            variable=self.qwen38_fast_subtitles_var,
+            style="Surface.TCheckbutton",
+        ).pack(side="left")
+        ttk.Label(
+            self.fast_subtitle_options,
+            text="短暂停顿可能单独成段，Token 用量可能增加。",
+            style="Helper.TLabel",
+        ).pack(side="left", padx=(ui.SPACE_2, 0))
 
     def _build_minutes_settings_tab(self, tab: ttk.Frame) -> None:
         for column in range(2):
@@ -1345,6 +1409,7 @@ class InterpreterApp:
 
     def _save_and_close_settings(self) -> None:
         if self._save_credentials():
+            self._sync_voice_choices()
             self._close_settings()
 
     def _toggle_secret_visibility(self) -> None:
@@ -1579,6 +1644,7 @@ class InterpreterApp:
                 self.interpreter_model_var.get()
             ),
             interpreter_websocket_url=self.interpreter_websocket_url_var.get().strip(),
+            qwen38_fast_subtitles=self.qwen38_fast_subtitles_var.get(),
             meeting_minutes_provider=self._minutes_provider_id(),
             meeting_minutes_model=normalize_model_name(self.minutes_model_var.get()),
             meeting_minutes_api_url=self.minutes_api_url_var.get().strip(),
@@ -1609,6 +1675,7 @@ class InterpreterApp:
             return
         running = self._state != "idle"
         interpreter_id = self._interpreter_provider_id()
+        self._sync_fast_subtitle_control()
         minutes_id = self._minutes_provider_id()
         self.workspace_id_entry.configure(
             state="disabled"
@@ -1657,6 +1724,17 @@ class InterpreterApp:
             )
         )
 
+    def _sync_fast_subtitle_control(self, *_args: str) -> None:
+        if self._settings_window is None:
+            return
+        if (
+            self._interpreter_provider_id() == INTERPRETER_QWEN
+            and supports_qwen38_fast_subtitles(self.interpreter_model_var.get(), "")
+        ):
+            self.fast_subtitle_options.grid()
+        else:
+            self.fast_subtitle_options.grid_remove()
+
     def _on_interpreter_provider_changed(self, _event: object = None) -> None:
         self._clear_settings_error()
         if (
@@ -1675,9 +1753,16 @@ class InterpreterApp:
         if self.voice_var.get() not in labels:
             self.voice_var.set(labels[0])
         if hasattr(self, "silence_gate_check"):
+            continuous_audio = uses_qwen38_protocol(self.interpreter_model_var.get())
             self.silence_gate_check.configure(
-                text="省流量静音门控",
-                state="disabled" if self._state != "idle" else "normal",
+                text=(
+                    "3.8 使用服务端静音检测"
+                    if continuous_audio else "省流量静音门控"
+                ),
+                state=(
+                    "disabled"
+                    if self._state != "idle" or continuous_audio else "normal"
+                ),
             )
 
     def _on_minutes_provider_changed(self, _event: object = None) -> None:
@@ -1881,6 +1966,7 @@ class InterpreterApp:
             ),
             "on_diagnostic": self._log_connection_status,
             "use_silence_gate": self.silence_gate_var.get(),
+            "qwen38_fast_subtitles": self.qwen38_fast_subtitles_var.get(),
         }
         self._session = QwenInterpreterSession(
             api_key=self.api_key_var.get(),
@@ -2101,14 +2187,12 @@ class InterpreterApp:
             self._diagnostic_logger.log(status)
 
     def _drain_events(self) -> None:
-        try:
-            while True:
-                event = self._events.get_nowait()
-                self._handle_ui_message(event)
-        except queue.Empty:
-            pass
+        messages = self._events.take(self.MAX_EVENTS_PER_POLL)
+        for message in messages:
+            self._handle_ui_message(message)
         if self.root.winfo_exists():
-            self.root.after(self.POLL_MS, self._drain_events)
+            delay = 1 if len(messages) == self.MAX_EVENTS_PER_POLL else self.POLL_MS
+            self.root.after(delay, self._drain_events)
 
     def _handle_ui_message(self, message: UiMessage) -> None:
         if message.kind == "started":
@@ -2157,6 +2241,7 @@ class InterpreterApp:
                 event.translated_text,
                 event.is_final,
                 event.alignment_status,
+                event.segment_id,
             )
             self._record_turn("incoming", message.payload)
             self._show_translation(
@@ -2172,6 +2257,7 @@ class InterpreterApp:
                 event.translated_text,
                 event.is_final,
                 event.alignment_status,
+                event.segment_id,
             )
             self._record_turn("outgoing", message.payload)
             self._show_translation(
@@ -2309,30 +2395,94 @@ class InterpreterApp:
         self._update_minutes_button()
 
     @staticmethod
+    def _update_transcript_line(
+        history: tk.Text,
+        line_tag: str,
+        segment_tag: str,
+        text: str,
+        style: str,
+    ) -> None:
+        start, end = history.tag_ranges(line_tag)
+        # Each line tag includes its trailing newline, which anchors the range
+        # while its contents change. Keep the stable prefix and edit only its tail.
+        body_end = history.index(f"{end}-1c")
+        previous = history.get(start, body_end)
+        if previous != text:
+            common = 0
+            for old_char, new_char in zip(previous, text):
+                if old_char != new_char:
+                    break
+                common += 1
+            edit_start = history.index(f"{start}+{common}c")
+            if common < len(previous):
+                history.delete(edit_start, body_end)
+            if common < len(text):
+                history.insert(
+                    edit_start, text[common:], (style, segment_tag, line_tag),
+                )
+        start, end = history.tag_ranges(line_tag)
+        for other_style in ("source", "translation", "alignment_warning"):
+            if other_style != style:
+                history.tag_remove(other_style, start, end)
+        history.tag_add(style, start, end)
+
+    @staticmethod
     def _show_translation(
         event: TranslationEvent,
         interim_var: tk.StringVar,
         history: tk.Text,
     ) -> None:
-        if not event.is_final:
-            preview = event.translated_text or event.source_text
-            if preview:
-                interim_var.set(preview)
+        if not (event.source_text or event.translated_text):
             return
-        interim_var.set("正在聆听…")
+        segment_tag = f"live_segment:{event.segment_id or 'current'}"
+        source_tag = f"live_source:{event.segment_id or 'current'}"
+        translation_tag = f"live_translation:{event.segment_id or 'current'}"
+        follow_latest = history.yview()[1] >= 0.99
         history.configure(state="normal")
-        if history.tag_ranges("placeholder"):
-            history.delete("1.0", "end")
-        if event.source_text:
-            history.insert("end", event.source_text + "\n", "source")
-        elif event.alignment_status == "translation_only":
-            history.insert("end", "[原文缺失]\n", "alignment_warning")
-        if event.translated_text:
-            history.insert("end", event.translated_text + "\n", "translation")
-        elif event.alignment_status == "source_only":
-            history.insert("end", "[译文缺失]\n", "alignment_warning")
-        history.see("end")
-        history.configure(state="disabled")
+        try:
+            if history.tag_ranges("placeholder"):
+                history.delete("1.0", "end")
+            source = event.source_text or (
+                "[原文缺失]" if event.is_final else "正在识别…"
+            )
+            translated = event.translated_text or (
+                "[译文缺失]" if event.is_final else "正在翻译…"
+            )
+            source_style = "source" if event.source_text else "alignment_warning"
+            translated_style = (
+                "translation" if event.translated_text else "alignment_warning"
+            )
+            if history.tag_ranges(segment_tag):
+                InterpreterApp._update_transcript_line(
+                    history, source_tag, segment_tag,
+                    f"原文：{source}", source_style,
+                )
+                InterpreterApp._update_transcript_line(
+                    history, translation_tag, segment_tag,
+                    f"译文：{translated}", translated_style,
+                )
+            else:
+                history.insert(
+                    "end-1c",
+                    f"原文：{source}\n",
+                    (source_style, segment_tag, source_tag),
+                    f"译文：{translated}\n",
+                    (translated_style, segment_tag, translation_tag),
+                    "\n", (segment_tag,),
+                )
+            if event.is_final:
+                history.tag_delete(segment_tag, source_tag, translation_tag)
+            if follow_latest:
+                history.see("end")
+        finally:
+            history.configure(state="disabled")
+        has_live_segment = any(
+            tag.startswith("live_segment:") and history.tag_ranges(tag)
+            for tag in history.tag_names()
+        )
+        status = "中英文实时更新中…" if has_live_segment else "正在聆听…"
+        if interim_var.get() != status:
+            interim_var.set(status)
 
     def _set_controls_running(self, running: bool, ready: bool = True) -> None:
         combo_state = "disabled" if running else "readonly"

@@ -39,6 +39,7 @@ class AppSettings:
     visual_api_url: str = ""
     visual_extra_body: str = "{}"
     visual_key_source: str = "interpreter"
+    qwen38_fast_subtitles: bool = False
 
 
 def default_settings_path() -> Path:
@@ -120,6 +121,7 @@ def load_settings(path: Path | None = None) -> AppSettings:
     return AppSettings(
         interpreter_provider=interpreter_provider,
         interpreter_model=interpreter_model,
+        qwen38_fast_subtitles=raw.get("qwen38_fast_subtitles") is True,
         interpreter_websocket_url=string_value("interpreter_websocket_url", ""),
         meeting_minutes_provider=minutes_provider,
         meeting_minutes_model=minutes_model,
@@ -168,6 +170,7 @@ def save_settings(settings: AppSettings, path: Path | None = None) -> None:
     payload: dict[str, Any] = {
         "interpreter_provider": interpreter_provider,
         "interpreter_model": interpreter_model,
+        "qwen38_fast_subtitles": settings.qwen38_fast_subtitles,
         "interpreter_websocket_url": settings.interpreter_websocket_url.strip(),
         "meeting_minutes_provider": minutes_provider,
         "meeting_minutes_model": minutes_model,

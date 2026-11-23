@@ -11,14 +11,36 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from simultaneous_interpreter.meeting_minutes import DEFAULT_MINUTES_MODEL  # noqa: E402
 from simultaneous_interpreter.provider_config import INTERPRETER_QWEN_COMPATIBLE  # noqa: E402
+from simultaneous_interpreter.qwen_backend import QWEN35_MODEL_NAME, QWEN38_MODEL_NAME  # noqa: E402
 from simultaneous_interpreter.settings_store import AppSettings, load_settings, save_settings  # noqa: E402
 
 
 class SettingsStoreTests(unittest.TestCase):
+    def test_fast_subtitles_require_explicit_opt_in_and_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            self.assertFalse(load_settings(path).qwen38_fast_subtitles)
+            path.write_text('{"qwen38_fast_subtitles":"false"}', encoding="utf-8")
+            self.assertFalse(load_settings(path).qwen38_fast_subtitles)
+            save_settings(AppSettings(qwen38_fast_subtitles=True), path)
+            self.assertTrue(load_settings(path).qwen38_fast_subtitles)
+
     def test_load_missing_settings_returns_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "settings.json"
-            self.assertEqual(load_settings(path).meeting_minutes_model, DEFAULT_MINUTES_MODEL)
+            settings = load_settings(path)
+            self.assertEqual(settings.interpreter_model, QWEN38_MODEL_NAME)
+            self.assertEqual(settings.meeting_minutes_model, DEFAULT_MINUTES_MODEL)
+
+    def test_saved_qwen35_selection_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            path.write_text(
+                '{"interpreter_model": "qwen3.5-livetranslate-flash-realtime"}',
+                encoding="utf-8",
+            )
+            settings = load_settings(path)
+            self.assertEqual(settings.interpreter_model, QWEN35_MODEL_NAME)
 
     def test_save_and_load_minutes_model(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -80,6 +102,7 @@ class SettingsStoreTests(unittest.TestCase):
                 encoding="utf-8",
             )
             settings = load_settings(path)
+            self.assertEqual(settings.interpreter_model, QWEN38_MODEL_NAME)
             self.assertEqual(settings.visual_model, "qwen3-vl-plus")
             self.assertEqual(settings.visual_key_source, "interpreter")
 

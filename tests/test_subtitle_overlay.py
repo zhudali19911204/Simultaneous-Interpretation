@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import sys
 import unittest
+from functools import partial
 from pathlib import Path
+from typing import Callable
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +16,21 @@ from simultaneous_interpreter.subtitle_overlay import (  # noqa: E402
     compact_subtitle,
     make_overlay_text,
 )
+
+
+class FakeOwner:
+    def __init__(self) -> None:
+        self.callbacks: dict[str, Callable[[], None]] = {}
+        self.sequence = 0
+
+    def after(self, delay: int, callback: Callable[..., None], *args: object) -> str:
+        self.sequence += 1
+        identifier = f"after-{self.sequence}"
+        self.callbacks[identifier] = partial(callback, *args)
+        return identifier
+
+    def after_cancel(self, identifier: str) -> None:
+        del self.callbacks[identifier]
 
 
 class SubtitleOverlayTests(unittest.TestCase):
@@ -96,6 +113,42 @@ class SubtitleOverlayTests(unittest.TestCase):
         self.assertEqual(buffer.entries[-1].chinese, "大家好，欢迎参加会议")
         self.assertEqual(buffer.entries[-1].english, "Hello")
 
+    def test_late_final_keeps_newer_live_rows_in_arrival_order(self) -> None:
+        buffer = RollingSubtitleBuffer()
+        buffer.update(make_overlay_text("incoming", "One", "一", False, segment_id="1"))
+        buffer.update(make_overlay_text("incoming", "Two", "二", False, segment_id="2"))
+        buffer.update(make_overlay_text("outgoing", "三", "Three", False, segment_id="1"))
+        first_final = make_overlay_text("incoming", "One.", "一。", True, segment_id="1")
+        buffer.update(first_final)
+        buffer.update(make_overlay_text("incoming", "One", "", False, segment_id="1"))
+        self.assertEqual(buffer.entries[0], first_final)
+        self.assertEqual(
+            [(row.english, row.is_final) for row in buffer.entries],
+            [("One.", True), ("Two", False), ("Three", False)],
+        )
+
+    def test_unrelated_segments_with_same_prefix_keep_their_own_translation(self) -> None:
+        buffer = RollingSubtitleBuffer()
+        buffer.update(make_overlay_text("incoming", "Good", "好", False, segment_id="1"))
+        buffer.update(make_overlay_text("incoming", "Good luck", "", False, segment_id="2"))
+        self.assertEqual([row.chinese for row in buffer.entries], ["好", "正在翻译…"])
+
+    def test_interleaved_speakers_without_segment_ids_keep_separate_live_rows(self) -> None:
+        buffer = RollingSubtitleBuffer()
+        buffer.update(make_overlay_text("incoming", "Hi", "", False))
+        buffer.update(make_overlay_text("outgoing", "你好", "", False))
+        buffer.update(make_overlay_text("incoming", "Hi.", "嗨。", True))
+        self.assertEqual([row.chinese for row in buffer.entries], ["嗨。", "你好"])
+
+    def test_replayed_final_without_id_keeps_one_history_row(self) -> None:
+        buffer = RollingSubtitleBuffer()
+        final = make_overlay_text("incoming", "Hi", "嗨", True)
+        buffer.update(final)
+        buffer.update(make_overlay_text("incoming", "Hi", "", False))
+        buffer.update(make_overlay_text("outgoing", "你好", "", False))
+        buffer.update(final)
+        self.assertEqual([row.chinese for row in buffer.entries], ["嗨", "你好"])
+
     def test_expiring_interim_does_not_remove_final_history(self) -> None:
         buffer = RollingSubtitleBuffer(max_items=3)
         buffer.update(make_overlay_text("outgoing", "第一句", "First", True))
@@ -104,21 +157,25 @@ class SubtitleOverlayTests(unittest.TestCase):
         self.assertEqual(len(buffer.entries), 1)
         self.assertEqual(buffer.entries[0].english, "First")
 
+    def test_interim_expiry_is_independent_and_reset_cancels_pending_timers(self) -> None:
+        owner = FakeOwner()
+        overlay = SubtitleOverlay(owner, object(), lambda: None)  # type: ignore[arg-type]
+        overlay.update_translation("incoming", "One", "", False, segment_id="1")
+        overlay.update_translation("incoming", "Two", "", False, segment_id="2")
+        overlay.update_translation("outgoing", "三", "", False, segment_id="3")
+        overlay.update_translation("incoming", "One.", "一。", True, segment_id="1")
+        self.assertEqual(len(owner.callbacks), 2)
+        second_timer = next(iter(owner.callbacks))
+        owner.callbacks.pop(second_timer)()
+        self.assertEqual([row.segment_id for row in overlay._buffer.entries], ["1", "3"])
+        overlay.reset()
+        self.assertFalse(owner.callbacks)
+        self.assertFalse(overlay._buffer.entries)
+        overlay.update_translation("incoming", "New", "", False, segment_id="2")
+        overlay.destroy()
+        self.assertFalse(owner.callbacks)
+
     def test_connection_notice_is_separate_and_auto_clears(self) -> None:
-        class FakeOwner:
-            def __init__(self) -> None:
-                self.callbacks = {}
-                self.sequence = 0
-
-            def after(self, _delay, callback):
-                self.sequence += 1
-                identifier = f"after-{self.sequence}"
-                self.callbacks[identifier] = callback
-                return identifier
-
-            def after_cancel(self, identifier):
-                self.callbacks.pop(identifier, None)
-
         owner = FakeOwner()
         overlay = SubtitleOverlay(  # type: ignore[arg-type]
             owner,

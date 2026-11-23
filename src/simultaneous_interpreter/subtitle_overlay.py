@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 import tkinter as tk
-from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 
@@ -25,6 +24,11 @@ class OverlayText:
     english: str
     is_final: bool
     alignment_status: str = "matched"
+    segment_id: str = ""
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return self.role, self.segment_id
 
 
 def compact_subtitle(text: str, max_chars: int = MAX_SUBTITLE_CHARS) -> str:
@@ -40,6 +44,7 @@ def make_overlay_text(
     translated_text: str,
     is_final: bool,
     alignment_status: str = "matched",
+    segment_id: str = "",
 ) -> OverlayText:
     source = compact_subtitle(source_text)
     translated = compact_subtitle(translated_text)
@@ -61,6 +66,7 @@ def make_overlay_text(
         english=english or ENGLISH_PENDING,
         is_final=is_final,
         alignment_status=alignment_status,
+        segment_id=segment_id,
     )
 
 
@@ -69,34 +75,50 @@ class RollingSubtitleBuffer:
         if max_items < 1:
             raise ValueError("滚动字幕条目数必须大于 0")
         self._max_items = max_items
-        self._history: deque[OverlayText] = deque(maxlen=max_items)
-        self._current: OverlayText | None = None
+        self._rows: list[OverlayText] = []
 
     @property
     def entries(self) -> tuple[OverlayText, ...]:
-        entries = [*self._history]
-        if self._current:
-            entries.append(self._current)
-        return tuple(entries[-self._max_items :])
+        return tuple(self._rows[-self._max_items :])
 
     def update(self, text: OverlayText) -> None:
-        if text.is_final:
-            if not self._history or self._history[-1] != text:
-                self._history.append(text)
-            self._current = None
+        if text.is_final and not text.segment_id:
+            last_final = next(
+                (row for row in reversed(self._rows) if row.is_final),
+                None,
+            )
+            if last_final == text:
+                self.clear_current(text.key)
+                return
+        for index, row in enumerate(self._rows):
+            if row.key != text.key or (row.is_final and not text.segment_id):
+                continue
+            if text.is_final:
+                self._rows[index] = text
+            elif not row.is_final:
+                self._rows[index] = self._merge_interim(row, text)
+            break
         else:
-            self._current = self._merge_interim(text)
+            self._rows.append(text)
 
-    def clear_current(self) -> None:
-        self._current = None
+        if text.is_final:
+            finals = [i for i, row in enumerate(self._rows) if row.is_final]
+            if len(finals) > self._max_items:
+                del self._rows[finals[0]]
+
+    def clear_current(self, key: tuple[str, str] | None = None) -> None:
+        self._rows = [
+            row for row in self._rows
+            if row.is_final or (key is not None and row.key != key)
+        ]
 
     def reset(self) -> None:
-        self._history.clear()
-        self._current = None
+        self._rows.clear()
 
-    def _merge_interim(self, text: OverlayText) -> OverlayText:
-        current = self._current
-        if not current or not self._same_utterance(current, text):
+    def _merge_interim(
+        self, current: OverlayText, text: OverlayText,
+    ) -> OverlayText:
+        if not text.segment_id and not self._same_utterance(current, text):
             return text
         chinese = text.chinese
         english = text.english
@@ -110,6 +132,7 @@ class RollingSubtitleBuffer:
             english=english,
             is_final=False,
             alignment_status=text.alignment_status,
+            segment_id=text.segment_id,
         )
 
     @staticmethod
@@ -139,7 +162,7 @@ class SubtitleOverlay:
         self._on_hidden = on_hidden
         self._window: tk.Toplevel | None = None
         self._subtitle_text: tk.Text | None = None
-        self._clear_after_id: str | None = None
+        self._clear_after_ids: dict[tuple[str, str], str] = {}
         self._notice_after_id: str | None = None
         self._connection_notice = ""
         self._connection_notice_kind = "warning"
@@ -177,7 +200,7 @@ class SubtitleOverlay:
             self._on_hidden()
 
     def destroy(self) -> None:
-        self._cancel_clear()
+        self._cancel_all_interim_timers()
         self._cancel_notice_clear()
         if self._window and self._window.winfo_exists():
             self._window.destroy()
@@ -214,32 +237,30 @@ class SubtitleOverlay:
         translated_text: str,
         is_final: bool,
         alignment_status: str = "matched",
+        segment_id: str = "",
     ) -> None:
-        self._buffer.update(
-            make_overlay_text(
-                direction,
-                source_text,
-                translated_text,
-                is_final,
-                alignment_status,
-            )
+        text = make_overlay_text(
+            direction, source_text, translated_text, is_final,
+            alignment_status, segment_id,
         )
+        self._buffer.update(text)
         self._render()
-        self._cancel_clear()
+        previous_timer = self._clear_after_ids.pop(text.key, None)
+        if previous_timer is not None:
+            self._owner.after_cancel(previous_timer)
         if not is_final:
-            self._clear_after_id = self._owner.after(
-                INTERIM_HOLD_MS,
-                self._expire_interim,
+            self._clear_after_ids[text.key] = self._owner.after(
+                INTERIM_HOLD_MS, self._expire_interim, text.key,
             )
 
     def reset(self) -> None:
-        self._clear_after_id = None
+        self._cancel_all_interim_timers()
         self._buffer.reset()
         self._render()
 
-    def _expire_interim(self) -> None:
-        self._clear_after_id = None
-        self._buffer.clear_current()
+    def _expire_interim(self, key: tuple[str, str]) -> None:
+        self._clear_after_ids.pop(key, None)
+        self._buffer.clear_current(key)
         self._render()
 
     @staticmethod
@@ -359,7 +380,7 @@ class SubtitleOverlay:
         self._positioned = True
 
     def _render(self) -> None:
-        if not self._subtitle_text:
+        if not self._subtitle_text or not self.visible:
             return
         entries = self._buffer.entries or (self._waiting_text(),)
         text = self._subtitle_text
@@ -384,10 +405,10 @@ class SubtitleOverlay:
         text.see("end")
         text.configure(state="disabled")
 
-    def _cancel_clear(self) -> None:
-        if self._clear_after_id:
-            self._owner.after_cancel(self._clear_after_id)
-            self._clear_after_id = None
+    def _cancel_all_interim_timers(self) -> None:
+        for identifier in self._clear_after_ids.values():
+            self._owner.after_cancel(identifier)
+        self._clear_after_ids.clear()
 
     def _cancel_notice_clear(self) -> None:
         if self._notice_after_id:

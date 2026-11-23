@@ -8,9 +8,10 @@ import socket
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from uuid import uuid4
 
 import numpy as np
 import websocket
@@ -21,8 +22,12 @@ from .diagnostics import sanitize_diagnostic
 INPUT_SAMPLE_RATE = 16_000
 OUTPUT_SAMPLE_RATE = 24_000
 BLOCK_FRAMES = 320  # 20 ms of 16-bit mono PCM for lower capture latency
+CAPTURE_QUEUE_BLOCKS = 50  # absorb up to one second of stalled sends
+MAX_APPEND_BLOCKS = 8
 PLAYBACK_BLOCK_FRAMES = 480  # 20 ms at 24 kHz
-MODEL_NAME = "qwen3.5-livetranslate-flash-realtime"
+QWEN35_MODEL_NAME = "qwen3.5-livetranslate-flash-realtime"
+QWEN38_MODEL_NAME = "qwen3.8-livetranslate-flash-realtime"
+MODEL_NAME = QWEN38_MODEL_NAME
 GATE_THRESHOLD_RMS = 0.004
 GATE_PRE_ROLL_BLOCKS = 8  # 160 ms
 # Keep sending silence slightly beyond the typical server VAD boundary. Stopping
@@ -69,6 +74,7 @@ class TranslationEvent:
     translated_text: str
     is_final: bool
     alignment_status: str = "matched"
+    segment_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -76,12 +82,14 @@ class AlignmentOutput:
     event: TranslationEvent
     segment_index: int
     reason: str
+    first_target: str = "none"
+    first_target_ms: int | None = None
 
 
 @dataclass
 class _AlignmentSlot:
     index: int
-    opened_at: float
+    speech_started_at: float | None = None
     source_item_id: str = ""
     response_id: str = ""
     output_item_id: str = ""
@@ -89,7 +97,9 @@ class _AlignmentSlot:
     translated_preview: str = ""
     source_final: str | None = None
     translated_final: str | None = None
-    waiting_since: float | None = None
+    idle_since: float | None = None
+    first_target: str = "none"
+    first_target_ms: int | None = None
 
 
 class TranslationAligner:
@@ -127,6 +137,7 @@ class TranslationAligner:
         if self._active_speech is not None:
             self._start_waiting(self._active_speech, now)
         self._active_speech = self._new_slot(now)
+        self._active_speech.speech_started_at = now
         return self._drain(now)
 
     def speech_stopped(self) -> tuple[AlignmentOutput, ...]:
@@ -145,7 +156,27 @@ class TranslationAligner:
         if normalized_id and normalized_id in self._ignored_source_ids:
             return ()
         slot = self._source_slot(normalized_id)
-        slot.source_preview = text.strip()
+        preview = text.strip()
+        if slot.source_final is not None or slot.source_preview == preview:
+            return ()
+        slot.source_preview = preview
+        self._note_progress(slot)
+        return self._preview(slot)
+
+    def source_delta(
+        self,
+        item_id: str,
+        delta: str,
+    ) -> tuple[AlignmentOutput, ...]:
+        normalized_id = item_id.strip()
+        if not delta or normalized_id in self._ignored_source_ids:
+            return ()
+        slot = self._source_slot(normalized_id)
+        if slot.source_final is not None:
+            return ()
+        # Deltas can contain only whitespace; retain it between words.
+        slot.source_preview += delta
+        self._note_progress(slot)
         return self._preview(slot)
 
     def source_completed(
@@ -161,9 +192,8 @@ class TranslationAligner:
         if slot.source_final is None:
             slot.source_final = transcript.strip()
             slot.source_preview = slot.source_final
-        self._start_waiting(slot, now)
-        outputs = self._drain(now)
-        return outputs or self._preview(slot)
+            slot.idle_since = now
+        return self._after_completion(slot, now)
 
     def response_started(
         self,
@@ -190,7 +220,31 @@ class TranslationAligner:
         slot = self._response_slot(normalized_id)
         if output_item_id:
             slot.output_item_id = output_item_id.strip()
-        slot.translated_preview = text.strip()
+        preview = text.strip()
+        if slot.translated_final is not None or slot.translated_preview == preview:
+            return ()
+        slot.translated_preview = preview
+        self._note_first_target(slot, preview, "preview")
+        self._note_progress(slot)
+        return self._preview(slot)
+
+    def translation_delta(
+        self,
+        response_id: str,
+        output_item_id: str,
+        delta: str,
+    ) -> tuple[AlignmentOutput, ...]:
+        normalized_id = response_id.strip()
+        if not delta or normalized_id in self._ignored_response_ids:
+            return ()
+        slot = self._response_slot(normalized_id)
+        if slot.translated_final is not None:
+            return ()
+        if output_item_id:
+            slot.output_item_id = output_item_id.strip()
+        slot.translated_preview += delta
+        self._note_first_target(slot, delta, "preview")
+        self._note_progress(slot)
         return self._preview(slot)
 
     def translation_completed(
@@ -209,9 +263,9 @@ class TranslationAligner:
         if slot.translated_final is None:
             slot.translated_final = translated.strip()
             slot.translated_preview = slot.translated_final
-        self._start_waiting(slot, now)
-        outputs = self._drain(now)
-        return outputs or self._preview(slot)
+            slot.idle_since = now
+            self._note_first_target(slot, slot.translated_final, "final_only")
+        return self._after_completion(slot, now)
 
     def expire(self) -> tuple[AlignmentOutput, ...]:
         return self._drain(self._clock())
@@ -226,21 +280,24 @@ class TranslationAligner:
         self._active_speech = None
         return tuple(outputs)
 
-    def seconds_until_expiry(self) -> float | None:
+    def expiry_deadline(self) -> float | None:
         if not self._slots:
             return None
-        waiting_since = self._slots[0].waiting_since
-        if waiting_since is None:
+        idle_since = self._slots[0].idle_since
+        if idle_since is None:
             return None
-        deadline = waiting_since + self._timeout_seconds
+        return idle_since + self._timeout_seconds
+
+    def seconds_until_expiry(self) -> float | None:
+        deadline = self.expiry_deadline()
+        if deadline is None:
+            return None
         return max(0.0, deadline - self._clock())
 
     def _new_slot(self, now: float) -> _AlignmentSlot:
         if self._slots:
-            previous = self._slots[-1]
-            if previous.waiting_since is None:
-                self._start_waiting(previous, now)
-        slot = _AlignmentSlot(index=self._next_index, opened_at=now)
+            self._start_waiting(self._slots[-1], now)
+        slot = _AlignmentSlot(index=self._next_index)
         self._next_index += 1
         self._slots.append(slot)
         return slot
@@ -285,19 +342,42 @@ class TranslationAligner:
 
     @staticmethod
     def _start_waiting(slot: _AlignmentSlot, now: float) -> None:
-        if slot.waiting_since is None:
-            slot.waiting_since = now
+        if slot.idle_since is None:
+            slot.idle_since = now
+
+    def _note_progress(self, slot: _AlignmentSlot) -> None:
+        if slot.idle_since is not None:
+            slot.idle_since = self._clock()
+
+    def _note_first_target(self, slot: _AlignmentSlot, text: str, mode: str) -> None:
+        if slot.first_target != "none" or not text.strip():
+            return
+        slot.first_target = mode
+        if slot.speech_started_at is not None:
+            elapsed = self._clock() - slot.speech_started_at
+            slot.first_target_ms = round(elapsed * 1000)
+
+    def _after_completion(
+        self,
+        slot: _AlignmentSlot,
+        now: float,
+    ) -> tuple[AlignmentOutput, ...]:
+        outputs = self._drain(now)
+        # Draining older final events can leave this sentence pending.
+        if self._slots and self._slots[0].index <= slot.index:
+            return outputs + self._preview(slot)
+        return outputs
 
     def _preview(self, slot: _AlignmentSlot) -> tuple[AlignmentOutput, ...]:
         source = (
             slot.source_final
             if slot.source_final is not None
-            else slot.source_preview
+            else slot.source_preview.strip()
         )
         translated = (
             slot.translated_final
             if slot.translated_final is not None
-            else slot.translated_preview
+            else slot.translated_preview.strip()
         )
         if not (source or translated):
             return ()
@@ -318,8 +398,8 @@ class TranslationAligner:
                 and slot.translated_final is not None
             )
             expired = (
-                slot.waiting_since is not None
-                and now - slot.waiting_since >= self._timeout_seconds
+                slot.idle_since is not None
+                and now - slot.idle_since >= self._timeout_seconds
             )
             if not both_completed and not expired:
                 break
@@ -367,6 +447,8 @@ class TranslationAligner:
             ),
             segment_index=slot.index,
             reason=reason,
+            first_target=slot.first_target,
+            first_target_ms=slot.first_target_ms,
         )
 
 
@@ -517,6 +599,18 @@ def normalize_realtime_model_name(model: str) -> str:
     return normalized
 
 
+def uses_qwen38_protocol(model: str) -> bool:
+    normalized = model.strip().rsplit("/", 1)[-1].casefold()
+    return (
+        normalized == QWEN38_MODEL_NAME
+        or normalized.startswith(QWEN38_MODEL_NAME + "-")
+    )
+
+
+def supports_qwen38_fast_subtitles(model: str, websocket_url: str) -> bool:
+    return not websocket_url.strip() and uses_qwen38_protocol(model)
+
+
 def build_api_url(
     workspace_id: str,
     model: str = MODEL_NAME,
@@ -593,40 +687,100 @@ class EnergySpeechGate:
         return buffered
 
 
+class _CaptureBuffer:
+    """Bounded ordered handoff between a WASAPI recorder and one connection."""
+
+    def __init__(self) -> None:
+        self._blocks: deque[bytes] = deque()
+        self._condition = threading.Condition()
+        self.closed = False
+
+    def put(self, blocks: list[bytes]) -> None:
+        with self._condition:
+            # Apply backpressure only when the full jitter allowance is used.
+            self._condition.wait_for(
+                lambda: self.closed
+                or len(self._blocks) + len(blocks) <= CAPTURE_QUEUE_BLOCKS
+            )
+            if not self.closed:
+                self._blocks.extend(blocks)
+                self._condition.notify()
+
+    def take(self) -> bytes:
+        with self._condition:
+            self._condition.wait_for(lambda: self.closed or self._blocks)
+            count = min(len(self._blocks), MAX_APPEND_BLOCKS)
+            data = b"".join(self._blocks.popleft() for _ in range(count))
+            self._condition.notify()
+            return data
+
+    def close(self, *, discard: bool = False) -> None:
+        with self._condition:
+            self.closed = True
+            if discard:
+                self._blocks.clear()
+            self._condition.notify_all()
+
+
 class PcmCaptureWorker:
     def __init__(
         self,
         *,
         input_device: Any,
-        on_audio: Callable[[bytes], None],
         on_error: MessageCallback,
         use_silence_gate: bool,
     ) -> None:
         self._input_device = input_device
-        self._on_audio = on_audio
         self._on_error = on_error
         self._use_silence_gate = use_silence_gate
-        self._stop_event = threading.Event()
+        self._buffer = _CaptureBuffer()
         self._thread: threading.Thread | None = None
+        self._sender: threading.Thread | None = None
 
-    def start(self) -> None:
-        self._stop_event.clear()
+    def start(self, on_audio: Callable[[bytes], None]) -> None:
+        buffer = self._buffer = _CaptureBuffer()
+        self._sender = threading.Thread(
+            target=self._send,
+            args=(buffer, on_audio),
+            name="qwen-pcm-sender",
+            daemon=True,
+        )
         self._thread = threading.Thread(
             target=self._run,
+            args=(buffer,),
             name="qwen-pcm-capture",
             daemon=True,
         )
+        self._sender.start()
         self._thread.start()
 
     def request_stop(self) -> None:
-        self._stop_event.set()
+        self._buffer.close(discard=True)
 
-    def stop(self) -> None:
-        self.request_stop()
+    def stop(self) -> bool:
+        self._buffer.close()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2.0)
+        if self._sender and self._sender.is_alive():
+            self._sender.join(timeout=2.0)
+            if self._sender.is_alive():
+                self.request_stop()
+                return False
+        return True
 
-    def _run(self) -> None:
+    def _send(
+        self, buffer: _CaptureBuffer, on_audio: Callable[[bytes], None]
+    ) -> None:
+        try:
+            while pcm := buffer.take():
+                on_audio(pcm)
+        except Exception as exc:
+            if not buffer.closed:
+                self._on_error(f"发送音频失败：{exc}")
+        finally:
+            buffer.close(discard=True)
+
+    def _run(self, buffer: _CaptureBuffer) -> None:
         try:
             gate = EnergySpeechGate()
             with self._input_device.recorder(
@@ -634,18 +788,20 @@ class PcmCaptureWorker:
                 channels=1,
                 blocksize=BLOCK_FRAMES,
             ) as recorder:
-                while not self._stop_event.is_set():
+                while not buffer.closed:
                     block = recorder.record(numframes=BLOCK_FRAMES)
                     chunks = (
                         gate.process(block)
                         if self._use_silence_gate
                         else [_pcm_from_float(block)]
                     )
-                    for pcm in chunks:
-                        self._on_audio(pcm)
+                    if chunks:
+                        buffer.put(chunks)
         except Exception as exc:
-            if not self._stop_event.is_set():
+            if not buffer.closed:
                 self._on_error(f"音频捕获失败：{exc}")
+        finally:
+            buffer.close()
 
 
 class PcmPlaybackWorker:
@@ -737,6 +893,7 @@ class QwenLiveTranslateClient:
         direction: str,
         name: str,
         use_silence_gate: bool,
+        qwen38_fast_subtitles: bool = False,
     ) -> None:
         if audio_output and playback is None:
             raise ValueError("启用音频输出时必须提供播放设备")
@@ -745,6 +902,11 @@ class QwenLiveTranslateClient:
             raise ValueError("同传 API Key 不能为空")
         self._workspace_id = workspace_id.strip()
         self._api_url = build_api_url(workspace_id, model, websocket_url)
+        self._uses_qwen38_protocol = uses_qwen38_protocol(model)
+        self._qwen38_fast_subtitles = (
+            qwen38_fast_subtitles
+            and supports_qwen38_fast_subtitles(model, websocket_url)
+        )
         self._source_language = source_language
         self._target_language = target_language
         self._audio_output = audio_output
@@ -758,11 +920,13 @@ class QwenLiveTranslateClient:
         self._attempt_limiter = attempt_limiter or ConnectionAttemptLimiter()
         self._direction = direction
         self._name = name
+        self._stream_id = uuid4().hex
         self._capture = PcmCaptureWorker(
             input_device=input_device,
-            on_audio=self._send_audio,
             on_error=on_error,
-            use_silence_gate=use_silence_gate,
+            # 3.8 detects speech/speakers from a continuous audio timeline.
+            # Cutting off silence locally can leave its current turn pending.
+            use_silence_gate=use_silence_gate and not self._uses_qwen38_protocol,
         )
 
         self._ws: websocket.WebSocketApp | None = None
@@ -787,6 +951,7 @@ class QwenLiveTranslateClient:
         self._aligner = TranslationAligner()
         self._alignment_lock = threading.Lock()
         self._alignment_timer: threading.Timer | None = None
+        self._alignment_timer_deadline: float | None = None
 
     def start(self) -> None:
         self._connection_ready.clear()
@@ -835,8 +1000,18 @@ class QwenLiveTranslateClient:
     def stop(self) -> None:
         self._stopping = True
         self._stop_event.set()
-        self._capture.stop()
-        if self._configured and self._socket_open:
+        drained = self._capture.stop()
+        ws = self._ws
+        if not drained and ws:
+            # A blocked send can hold the WebSocket's write lock. Interrupt
+            # the underlying socket before asking WebSocketApp to close it.
+            try:
+                transport = ws.sock
+                if transport is not None:
+                    transport.abort()
+            except (OSError, websocket.WebSocketException):
+                pass
+        if drained and self._configured and self._socket_open:
             try:
                 self._send_json(
                     {
@@ -942,21 +1117,45 @@ class QwenLiveTranslateClient:
         )
 
     def build_session_update(self) -> dict[str, Any]:
-        session: dict[str, Any] = {
-            "modalities": ["text", "audio"]
-            if self._audio_output
-            else ["text"],
-            "sample_rate": INPUT_SAMPLE_RATE,
-            "input_audio_format": "pcm",
-            "output_audio_format": "pcm",
-            "input_audio_transcription": {
-                "model": "qwen3-asr-flash-realtime",
-                "language": self._source_language,
-            },
-            "translation": {"language": self._target_language},
-        }
-        if self._audio_output:
-            session["voice"] = self._voice_name
+        modalities = ["text", "audio"] if self._audio_output else ["text"]
+        session: dict[str, Any]
+        if self._uses_qwen38_protocol:
+            # 3.8 embeds ASR and detects the source language automatically.
+            # Its session schema is different from the 3.5 flat fields.
+            session = {
+                "input_modalities": ["audio"],
+                "output_modalities": modalities,
+                "audio": {
+                    "input": {
+                        "format": {
+                            "type": "pcm",
+                            "sample_rate": INPUT_SAMPLE_RATE,
+                        },
+                        "turn_detection": (
+                            {"type": "server_vad"}
+                            if self._qwen38_fast_subtitles
+                            else {"type": "speaker_detection", "threshold": 0.5}
+                        ),
+                    },
+                },
+                "translation": {"language": self._target_language},
+            }
+            if self._audio_output:
+                session["audio"]["output"] = {"voice": self._voice_name}
+        else:
+            session = {
+                "modalities": modalities,
+                "sample_rate": INPUT_SAMPLE_RATE,
+                "input_audio_format": "pcm",
+                "output_audio_format": "pcm",
+                "input_audio_transcription": {
+                    "model": "qwen3-asr-flash-realtime",
+                    "language": self._source_language,
+                },
+                "translation": {"language": self._target_language},
+            }
+            if self._audio_output:
+                session["voice"] = self._voice_name
         return {
             "event_id": self._next_event_id(),
             "type": "session.update",
@@ -1018,12 +1217,15 @@ class QwenLiveTranslateClient:
             return
 
         if event_type == "session.updated":
+            if self._stopping:
+                return
             self._configured = True
             self._ever_connected = True
             self._connection_ready.set()
             if not self._capture_started:
                 self._capture_started = True
-                self._capture.start()
+                ws = self._ws
+                self._capture.start(lambda pcm: self._send_audio(ws, pcm))
             self._emit_status("connected", attempt=self._current_attempt)
             return
 
@@ -1037,6 +1239,14 @@ class QwenLiveTranslateClient:
 
         if event_type == "input_audio_buffer.speech_stopped":
             self._process_alignment(self._aligner.speech_stopped)
+            return
+
+        if event_type == "conversation.item.input_audio_transcription.delta":
+            self._process_alignment(
+                self._aligner.source_delta,
+                str(event.get("item_id", "")),
+                str(event.get("delta", "")),
+            )
             return
 
         if event_type == "conversation.item.input_audio_transcription.text":
@@ -1072,6 +1282,18 @@ class QwenLiveTranslateClient:
                 self._aligner.response_started,
                 str(event.get("response_id", "")),
                 str(item.get("id", "")),
+            )
+            return
+
+        if event_type in {
+            "response.text.delta",
+            "response.audio_transcript.delta",
+        }:
+            self._process_alignment(
+                self._aligner.translation_delta,
+                str(event.get("response_id", "")),
+                str(event.get("item_id", "")),
+                str(event.get("delta", "")),
             )
             return
 
@@ -1139,8 +1361,17 @@ class QwenLiveTranslateClient:
         outputs: tuple[AlignmentOutput, ...],
     ) -> None:
         for output in outputs:
-            self._on_translation(output.event)
+            self._on_translation(replace(
+                output.event,
+                segment_id=(
+                    f"{self._stream_id}:{self._generation}:{output.segment_index}"
+                ),
+            ))
             if output.event.is_final:
+                timing = (
+                    f" first_target_ms={output.first_target_ms}"
+                    if output.first_target_ms is not None else ""
+                )
                 status = ConnectionStatus(
                     direction=self._direction,
                     state="alignment",
@@ -1149,32 +1380,45 @@ class QwenLiveTranslateClient:
                         f"segment={output.segment_index} "
                         "event=alignment.finalized "
                         f"result={output.event.alignment_status} "
-                        f"reason={output.reason} generation={self._generation}"
+                        f"reason={output.reason} generation={self._generation} "
+                        f"first_target={output.first_target}{timing}"
                     ),
                 )
                 self._on_diagnostic(status)
 
     def _schedule_alignment_timer_locked(self) -> None:
+        deadline = self._aligner.expiry_deadline()
+        scheduled = self._alignment_timer_deadline
+        if scheduled == deadline or (
+            scheduled is not None and deadline is not None and scheduled < deadline
+        ):
+            # A pending timer rechecks the latest idle deadline when it fires.
+            return
         if self._alignment_timer is not None:
             self._alignment_timer.cancel()
             self._alignment_timer = None
+        self._alignment_timer_deadline = deadline
         delay = self._aligner.seconds_until_expiry()
         if delay is None:
             return
         timer = threading.Timer(
             max(0.01, delay),
             self._on_alignment_timeout,
-            args=(self._generation,),
+            args=(self._generation, deadline),
         )
         timer.daemon = True
         self._alignment_timer = timer
         timer.start()
 
-    def _on_alignment_timeout(self, generation: int) -> None:
+    def _on_alignment_timeout(self, generation: int, deadline: float) -> None:
         with self._alignment_lock:
-            if generation != self._generation:
+            if (
+                generation != self._generation
+                or deadline != self._alignment_timer_deadline
+            ):
                 return
             self._alignment_timer = None
+            self._alignment_timer_deadline = None
             outputs = self._aligner.expire()
             self._schedule_alignment_timer_locked()
         self._deliver_alignment(outputs)
@@ -1184,6 +1428,7 @@ class QwenLiveTranslateClient:
             if self._alignment_timer is not None:
                 self._alignment_timer.cancel()
                 self._alignment_timer = None
+            self._alignment_timer_deadline = None
             self._aligner.reset()
 
     def _flush_alignment(self, reason: str) -> None:
@@ -1191,24 +1436,27 @@ class QwenLiveTranslateClient:
             if self._alignment_timer is not None:
                 self._alignment_timer.cancel()
                 self._alignment_timer = None
+            self._alignment_timer_deadline = None
             outputs = self._aligner.flush(reason)
         self._deliver_alignment(outputs)
 
-    def _send_audio(self, pcm: bytes) -> None:
-        if not self._configured:
+    def _send_audio(
+        self, ws: websocket.WebSocketApp | None, pcm: bytes
+    ) -> None:
+        if ws is None or ws is not self._ws or not self._configured:
             return
         try:
-            self._send_json(
-                {
-                    "event_id": self._next_event_id(),
-                    "type": "input_audio_buffer.append",
-                    "audio": base64.b64encode(pcm).decode("ascii"),
-                }
-            )
+            event = {
+                "event_id": self._next_event_id(),
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(pcm).decode("ascii"),
+            }
+            ws.send(json.dumps(event))
         except Exception as exc:
-            self._signal_transport_failure(
-                f"发送音频失败：{type(exc).__name__}: {exc}"
-            )
+            if ws is self._ws:
+                self._signal_transport_failure(
+                    f"发送音频失败：{type(exc).__name__}: {exc}"
+                )
 
     def _send_json(self, event: dict[str, Any]) -> None:
         with self._send_lock:
@@ -1331,6 +1579,7 @@ class QwenInterpreterSession:
         on_diagnostic: ConnectionStatusCallback | None = None,
         use_silence_gate: bool,
         english_audio_output: bool = True,
+        qwen38_fast_subtitles: bool = False,
     ) -> None:
         self._on_usage = on_usage
         self._usage = UsageStats()
@@ -1348,6 +1597,7 @@ class QwenInterpreterSession:
             workspace_id=workspace_id,
             model=model,
             websocket_url=websocket_url,
+            qwen38_fast_subtitles=qwen38_fast_subtitles,
             source_language="zh",
             target_language="en",
             audio_output=english_audio_output,
@@ -1369,6 +1619,7 @@ class QwenInterpreterSession:
             workspace_id=workspace_id,
             model=model,
             websocket_url=websocket_url,
+            qwen38_fast_subtitles=qwen38_fast_subtitles,
             source_language="en",
             target_language="zh",
             audio_output=False,

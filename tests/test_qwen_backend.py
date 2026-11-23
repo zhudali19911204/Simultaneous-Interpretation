@@ -26,6 +26,8 @@ from simultaneous_interpreter.qwen_backend import (  # noqa: E402
     MODEL_NAME,
     OUTPUT_SAMPLE_RATE,
     PLAYBACK_BLOCK_FRAMES,
+    QWEN35_MODEL_NAME,
+    QWEN38_MODEL_NAME,
     QwenInterpreterSession,
     QwenLiveTranslateClient,
     TranslationAligner,
@@ -59,6 +61,8 @@ class FakePlayback:
 def make_client(
     *,
     audio_output: bool = False,
+    model: str | None = None,
+    use_silence_gate: bool = True,
     statuses=None,
     diagnostics=None,
     attempt_limiter=None,
@@ -84,7 +88,8 @@ def make_client(
         attempt_limiter=attempt_limiter,
         direction="outgoing" if audio_output else "incoming",
         name="test",
-        use_silence_gate=True,
+        use_silence_gate=use_silence_gate,
+        **({"model": model} if model is not None else {}),
     )
     return client, events, usages, errors, playback
 
@@ -96,7 +101,7 @@ class FakeCapture:
         self.starts = 0
         self.stops = 0
 
-    def start(self) -> None:
+    def start(self, _on_audio) -> None:
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         self.starts += 1
@@ -104,12 +109,51 @@ class FakeCapture:
     def request_stop(self) -> None:
         self.active = 0
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         self.active = 0
         self.stops += 1
+        return True
 
 
 class InterpreterSessionOutputTests(unittest.TestCase):
+    def test_fast_subtitles_changes_both_official_qwen38_directions_only(self) -> None:
+        def session(model: str, url: str, *, fast: bool) -> QwenInterpreterSession:
+            return QwenInterpreterSession(
+                api_key="test-key", workspace_id="ws-test",
+                model=model, websocket_url=url,
+                microphone=object(), teams_loopback=object(),
+                virtual_output=object(), english_voice="Tina",
+                on_incoming=lambda _event: None, on_outgoing=lambda _event: None,
+                on_usage=lambda _usage: None, on_error=lambda _message: None,
+                use_silence_gate=True, qwen38_fast_subtitles=fast,
+            )
+
+        for model, url, supported in (
+            (QWEN38_MODEL_NAME, "", True),
+            (QWEN38_MODEL_NAME + "-2026-09-17", "", True),
+            (QWEN35_MODEL_NAME, "", False),
+            (QWEN38_MODEL_NAME, "wss://gateway.example.com/realtime", False),
+            ("vendor/other", "wss://gateway.example.com/realtime", False),
+        ):
+            with self.subTest(model=model, url=url):
+                baseline = session(model, url, fast=False)
+                fast_session = session(model, url, fast=True)
+                for original, fast in (
+                    (baseline._incoming, fast_session._incoming),
+                    (baseline._outgoing, fast_session._outgoing),
+                ):
+                    expected = original.build_session_update()["session"]
+                    if supported:
+                        self.assertEqual(
+                            expected["audio"]["input"]["turn_detection"],
+                            {"type": "speaker_detection", "threshold": 0.5},
+                        )
+                        expected["audio"]["input"]["turn_detection"] = {
+                            "type": "server_vad",
+                        }
+                        self.assertFalse(fast._capture._use_silence_gate)
+                    self.assertEqual(fast.build_session_update()["session"], expected)
+
     @patch("simultaneous_interpreter.qwen_backend.PcmPlaybackWorker")
     @patch("simultaneous_interpreter.qwen_backend.QwenLiveTranslateClient")
     def test_english_audio_can_be_disabled_without_stopping_text_translation(
@@ -136,6 +180,8 @@ class InterpreterSessionOutputTests(unittest.TestCase):
         outgoing_options = live_client.call_args_list[0].kwargs
         self.assertFalse(outgoing_options["audio_output"])
         self.assertIsNone(outgoing_options["playback"])
+        for call in live_client.call_args_list:
+            self.assertEqual(call.kwargs["model"], QWEN38_MODEL_NAME)
         session.start()
         session.test_output()
         session.stop()
@@ -184,7 +230,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(
             url,
             "wss://ws-test_123.cn-beijing.maas.aliyuncs.com"
-            f"/api-ws/v1/realtime?model={MODEL_NAME}",
+            "/api-ws/v1/realtime?model=qwen3.8-livetranslate-flash-realtime",
         )
 
     def test_api_url_rejects_unsafe_workspace(self) -> None:
@@ -203,21 +249,68 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_api_url("", MODEL_NAME, "https://gateway.example.com/realtime")
 
-    def test_audio_session_configuration(self) -> None:
-        client, *_ = make_client(audio_output=True)
+    def test_qwen35_audio_session_configuration(self) -> None:
+        client, *_ = make_client(model=QWEN35_MODEL_NAME, audio_output=True)
         session = client.build_session_update()["session"]
         self.assertEqual(session["modalities"], ["text", "audio"])
         self.assertEqual(session["input_audio_transcription"]["language"], "zh")
         self.assertEqual(session["translation"]["language"], "en")
         self.assertEqual(session["voice"], "Tina")
 
-    def test_text_session_configuration(self) -> None:
-        client, *_ = make_client(audio_output=False)
+    def test_qwen35_text_session_configuration(self) -> None:
+        client, *_ = make_client(model=QWEN35_MODEL_NAME, audio_output=False)
         session = client.build_session_update()["session"]
         self.assertEqual(session["modalities"], ["text"])
         self.assertEqual(session["input_audio_transcription"]["language"], "en")
         self.assertEqual(session["translation"]["language"], "zh")
         self.assertNotIn("voice", session)
+
+    def test_default_client_uses_qwen38_audio_and_output_configuration(self) -> None:
+        for audio_output in (False, True):
+            with self.subTest(audio_output=audio_output):
+                client, *_ = make_client(audio_output=audio_output)
+                self.assertTrue(client._api_url.endswith(f"model={QWEN38_MODEL_NAME}"))
+                session = client.build_session_update()["session"]
+                self.assertEqual(session["input_modalities"], ["audio"])
+                self.assertEqual(
+                    session["output_modalities"],
+                    ["text", "audio"] if audio_output else ["text"],
+                )
+                self.assertEqual(
+                    session["audio"]["input"]["format"],
+                    {"type": "pcm", "sample_rate": INPUT_SAMPLE_RATE},
+                )
+                self.assertEqual(
+                    session["audio"]["input"]["turn_detection"],
+                    {"type": "speaker_detection", "threshold": 0.5},
+                )
+                self.assertEqual(
+                    session["translation"]["language"],
+                    "en" if audio_output else "zh",
+                )
+                if audio_output:
+                    self.assertEqual(session["audio"]["output"]["voice"], "Tina")
+                else:
+                    self.assertNotIn("output", session["audio"])
+                for legacy_field in (
+                    "modalities", "sample_rate", "input_audio_format",
+                    "output_audio_format", "input_audio_transcription", "voice",
+                ):
+                    self.assertNotIn(legacy_field, session)
+
+    def test_qwen38_keeps_audio_continuous_for_server_speech_detection(self) -> None:
+        for model in (
+            "qwen3.8-livetranslate-flash-realtime",
+            "qwen3.8-livetranslate-flash-realtime-2026-09-17",
+        ):
+            with self.subTest(model=model):
+                client, *_ = make_client(model=model)
+                self.assertFalse(client._capture._use_silence_gate)
+        for use_silence_gate in (False, True):
+            client, *_ = make_client(
+                model=QWEN35_MODEL_NAME, use_silence_gate=use_silence_gate,
+            )
+            self.assertEqual(client._capture._use_silence_gate, use_silence_gate)
 
     def test_reconnect_delay_is_capped(self) -> None:
         self.assertEqual(
@@ -567,10 +660,39 @@ class ReconnectionTests(unittest.TestCase):
         client._capture = capture  # type: ignore[assignment]
         client._socket_open = True
         client._configured = True
-        client._send_audio(b"\x00\x00")
+        client._send_audio(socket, b"\x00\x00")  # type: ignore[arg-type]
         self.assertIn("发送音频失败", client._last_transport_error)
         self.assertFalse(client._configured)
         self.assertTrue(socket.closed)
+        self.assertEqual(errors, [])
+
+    def test_previous_connection_send_failure_cannot_stop_new_capture(self) -> None:
+        client, _, _, errors, _ = make_client()
+        in_send = threading.Event()
+        disconnected = threading.Event()
+
+        class OldSocket:
+            def send(self, _payload: str) -> None:
+                in_send.set()
+                disconnected.wait(2)
+                raise OSError("old connection closed")
+
+        old = OldSocket()
+        client._configured = True
+        client._ws = old  # type: ignore[assignment]
+        sender = threading.Thread(
+            target=client._send_audio, args=(old, b"old"), daemon=True
+        )
+        sender.start()
+        try:
+            self.assertTrue(in_send.wait(1))
+            client._ws = object()  # type: ignore[assignment]
+        finally:
+            disconnected.set()
+            sender.join(1)
+        client._send_audio(old, b"queued")  # type: ignore[arg-type]
+        self.assertEqual(client._last_transport_error, "")
+        self.assertTrue(client._configured)
         self.assertEqual(errors, [])
 
 
@@ -710,6 +832,57 @@ class TranslationAlignerTests(unittest.TestCase):
         self.assertEqual(outputs[0].event.source_text, "Next sentence")
         self.assertEqual(outputs[0].event.translated_text, "下一句")
 
+    def test_other_segments_and_repeated_snapshots_do_not_delay_timeout(self) -> None:
+        clock = FakeClock()
+        aligner = TranslationAligner(timeout_seconds=5.0, clock=clock)
+        aligner.source_completed("a", "First")
+        clock.advance(1.0)
+        aligner.translation_preview("a", "out-a", "首")
+        clock.advance(3.0)
+        aligner.translation_preview("a", "out-a", "首")
+        aligner.source_completed("a", "First")
+        aligner.source_completed("b", "Second")
+        aligner.translation_completed("b", "out-b", "第二句。")
+        clock.advance(2.0)
+
+        outputs = aligner.expire()
+        self.assertEqual(
+            [(output.event.source_text, output.reason) for output in outputs],
+            [("First", "timeout"), ("Second", "completed")],
+        )
+        self.assertEqual(outputs[0].event.alignment_status, "source_only")
+        self.assertEqual(outputs[1].first_target, "final_only")
+        self.assertIsNone(outputs[1].first_target_ms)
+
+    def test_new_sentence_preview_follows_an_older_timeout(self) -> None:
+        clock = FakeClock()
+        aligner = TranslationAligner(clock=clock)
+        aligner.source_completed("a", "First")
+        clock.advance(5.1)
+        outputs = aligner.source_completed("b", "Second")
+        self.assertEqual(
+            [(output.event.source_text, output.reason) for output in outputs],
+            [("First", "timeout"), ("Second", "preview")],
+        )
+        self.assertEqual(outputs[0].first_target, "none")
+        self.assertIsNone(outputs[0].first_target_ms)
+
+    def test_source_progress_keeps_completed_translation_waiting(self) -> None:
+        clock = FakeClock()
+        aligner = TranslationAligner(timeout_seconds=5.0, clock=clock)
+        aligner.translation_completed("a", "out-a", "完整译文")
+        clock.advance(4.0)
+        aligner.source_preview("a", "Full")
+        clock.advance(4.0)
+        self.assertEqual(aligner.expire(), ())
+        aligner.source_delta("a", " text")
+        clock.advance(4.0)
+        self.assertEqual(aligner.expire(), ())
+
+        outputs = aligner.source_completed("a", "Full text.")
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0].event.alignment_status, "matched")
+
     def test_flush_preserves_only_completed_side(self) -> None:
         aligner = TranslationAligner(clock=FakeClock())
         aligner.source_preview("source-a", "unfinished preview")
@@ -724,6 +897,274 @@ class TranslationAlignerTests(unittest.TestCase):
 
 
 class ResponseParsingTests(unittest.TestCase):
+    def test_first_target_diagnostics_follow_their_own_speech_start(self) -> None:
+        for event_type, field in (
+            ("response.text.delta", "delta"),
+            ("response.text.text", "text"),
+        ):
+            with self.subTest(event_type=event_type):
+                diagnostics = []
+                client, *_ = make_client(diagnostics=diagnostics)
+                clock = FakeClock()
+                client._aligner = TranslationAligner(clock=clock)
+                self.addCleanup(client._reset_alignment)
+
+                def receive(kind: str, **fields: str) -> None:
+                    client._handle_message(json.dumps({"type": kind, **fields}))
+
+                receive("input_audio_buffer.speech_started")
+                receive(
+                    "conversation.item.input_audio_transcription.completed",
+                    item_id="source-a", transcript="Private source A",
+                )
+                clock.advance(0.25)
+                receive(event_type, response_id="resp-a", **{field: " "})
+                clock.advance(0.5)
+                receive(event_type, response_id="resp-a", **{field: "Private A"})
+                clock.advance(0.25)
+                receive("input_audio_buffer.speech_started")
+                clock.advance(0.5)
+                receive(
+                    "response.text.done", response_id="resp-b", text="Private B",
+                )
+                receive(
+                    "conversation.item.input_audio_transcription.completed",
+                    item_id="source-b", transcript="Private source B",
+                )
+                self.assertEqual(diagnostics, [])
+                clock.advance(0.5)
+                receive(
+                    "response.text.done", response_id="resp-a", text="Private A.",
+                )
+                self.assertEqual(len(diagnostics), 2)
+                self.assertIn(
+                    "first_target=preview first_target_ms=750", diagnostics[0].detail,
+                )
+                self.assertIn(
+                    "first_target=final_only first_target_ms=500", diagnostics[1].detail,
+                )
+                for status in diagnostics:
+                    self.assertNotIn("resp-", status.detail)
+                    self.assertNotIn("Private", status.detail)
+
+    def test_long_translation_keeps_streaming_across_timer_wakeups(self) -> None:
+        client, events, *_ = make_client()
+        clock = FakeClock()
+        client._aligner = TranslationAligner(clock=clock)
+        with patch("simultaneous_interpreter.qwen_backend.threading.Timer") as timer:
+            client._handle_message(json.dumps({
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "source", "transcript": "One long sentence.",
+            }))
+            first_wakeup = timer.call_args.kwargs["args"]
+            for _ in range(4):
+                clock.advance(1.0)
+                client._handle_message(json.dumps({
+                    "type": "response.text.delta", "response_id": "response",
+                    "delta": "字",
+                }))
+            timer.assert_called_once()
+            clock.advance(1.0)
+            client._on_alignment_timeout(*first_wakeup)
+            self.assertEqual(timer.call_count, 2)
+            self.assertEqual(timer.call_args.args[0], 4.0)
+            self.assertFalse(any(event.is_final for event in events))
+            clock.advance(2.0)
+            client._handle_message(json.dumps({
+                "type": "response.text.done", "response_id": "response",
+                "text": "字字字字。",
+            }))
+            self.assertIsNone(client._alignment_timer)
+            self.assertEqual(len({event.segment_id for event in events}), 1)
+            self.assertEqual(
+                [event.translated_text for event in events if event.is_final],
+                ["字字字字。"],
+            )
+
+    def test_segment_id_is_stable_until_final_and_unique_across_connections(
+        self,
+    ) -> None:
+        client, events, *_ = make_client()
+        self.addCleanup(client._reset_alignment)
+        preview = json.dumps({
+            "type": "response.text.delta",
+            "response_id": "response-a", "delta": "你好",
+        })
+        client._handle_message(preview)
+        client._handle_message(json.dumps({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "source-a", "transcript": "Hello",
+        }))
+        client._handle_message(json.dumps({
+            "type": "response.text.done",
+            "response_id": "response-a", "text": "你好",
+        }))
+        first_id = events[0].segment_id
+        self.assertTrue(first_id)
+        self.assertTrue(events[-1].is_final)
+        self.assertEqual({event.segment_id for event in events}, {first_id})
+
+        client._prepare_connection(1)
+        client._handle_message(preview)
+        self.assertNotEqual(events[-1].segment_id, first_id)
+
+        other_client, other_events, *_ = make_client()
+        other_client._handle_message(preview)
+        self.assertNotEqual(other_events[0].segment_id, first_id)
+
+    def test_streaming_deltas_reuse_timeout_and_still_expire_missing_source(
+        self,
+    ) -> None:
+        client, events, *_ = make_client(
+            model="qwen3.8-livetranslate-flash-realtime",
+        )
+        clock = FakeClock()
+        client._aligner = TranslationAligner(clock=clock)
+        with patch("simultaneous_interpreter.qwen_backend.threading.Timer") as timer:
+            client._handle_message(json.dumps({
+                "type": "input_audio_buffer.speech_started",
+            }))
+            client._handle_message(json.dumps({
+                "type": "input_audio_buffer.speech_stopped",
+            }))
+            for _ in range(100):
+                client._handle_message(json.dumps({
+                    "type": "response.text.delta",
+                    "response_id": "resp-1", "delta": "字",
+                }))
+            timer.assert_called_once()
+            self.assertEqual(events[-1].translated_text, "字" * 100)
+            client._handle_message(json.dumps({
+                "type": "response.text.done",
+                "response_id": "resp-1", "text": "字" * 100,
+            }))
+            timer.assert_called_once()
+            timeout_args = timer.call_args.kwargs["args"]
+            clock.advance(5.1)
+            client._on_alignment_timeout(*timeout_args)
+            self.assertTrue(events[-1].is_final)
+            self.assertEqual(events[-1].alignment_status, "translation_only")
+            self.assertIsNone(client._alignment_timer)
+
+    def test_reconnect_drops_old_deltas_and_resets_accumulated_text(self) -> None:
+        client, events, *_ = make_client(
+            model="qwen3.8-livetranslate-flash-realtime",
+        )
+        client._generation = 1
+
+        def message(delta: str) -> str:
+            return json.dumps({
+                "type": "response.text.delta",
+                "response_id": "resp-1", "item_id": "out-1", "delta": delta,
+            })
+
+        client._on_message(1, object(), message("Old"))
+        client._prepare_connection(1)
+        client._on_message(1, object(), message(" stale"))
+        client._on_message(2, object(), message("New"))
+        self.assertEqual(
+            [event.translated_text for event in events], ["Old", "New"],
+        )
+
+    def test_qwen38_source_deltas_stream_before_completion(self) -> None:
+        client, events, _, errors, _ = make_client(
+            model="qwen3.8-livetranslate-flash-realtime",
+        )
+        for delta in ("Please", " ", "review", " the proposal."):
+            client._handle_message(json.dumps({
+                "type": "conversation.item.input_audio_transcription.delta",
+                "item_id": "source-1",
+                "delta": delta,
+            }))
+        self.assertEqual(errors, [])
+        self.assertGreaterEqual(len(events), 3)
+        self.assertEqual(events[0].source_text, "Please")
+        self.assertEqual(events[-1].source_text, "Please review the proposal.")
+        self.assertFalse(any(event.is_final for event in events))
+
+    def test_qwen38_translation_deltas_stream_and_keep_word_boundaries(self) -> None:
+        for event_type in ("response.text.delta", "response.audio_transcript.delta"):
+            with self.subTest(event_type=event_type):
+                client, events, _, errors, _ = make_client(
+                    model="qwen3.8-livetranslate-flash-realtime",
+                    audio_output="audio_transcript" in event_type,
+                )
+                for delta in ("Let's", " ", "start", " the meeting."):
+                    client._handle_message(json.dumps({
+                        "type": event_type,
+                        "response_id": "resp-1",
+                        "item_id": "output-1",
+                        "delta": delta,
+                    }))
+                self.assertEqual(errors, [])
+                self.assertGreaterEqual(len(events), 3)
+                self.assertEqual(events[0].translated_text, "Let's")
+                self.assertEqual(
+                    events[-1].translated_text, "Let's start the meeting.",
+                )
+                self.assertFalse(any(event.is_final for event in events))
+
+    def test_qwen38_interleaved_deltas_finalize_once_without_mixing(self) -> None:
+        client, events, _, _, _ = make_client(
+            model="qwen3.8-livetranslate-flash-realtime",
+        )
+        self.addCleanup(client._reset_alignment)
+        for item_id, delta in (("a", "First"), ("b", "Second"), ("a", " sentence")):
+            client._handle_message(json.dumps({
+                "type": "conversation.item.input_audio_transcription.delta",
+                "item_id": item_id,
+                "delta": delta,
+            }))
+        for response_id, delta in (("a", "第一"), ("b", "第二"), ("a", "句")):
+            client._handle_message(json.dumps({
+                "type": "response.text.delta",
+                "response_id": response_id,
+                "item_id": "out-" + response_id,
+                "delta": delta,
+            }))
+        self.assertTrue(events)
+        self.assertEqual(events[-1].source_text, "First sentence")
+        self.assertEqual(events[-1].translated_text, "第一句")
+        for item_id, source, translated in (
+            ("a", "First sentence.", "第一句。"),
+            ("b", "Second sentence.", "第二句。"),
+        ):
+            for event in (
+                {"type": "conversation.item.input_audio_transcription.completed",
+                 "item_id": item_id, "transcript": source},
+                {"type": "response.text.done", "response_id": item_id,
+                 "item_id": "out-" + item_id, "text": translated},
+                {"type": "response.text.delta", "response_id": item_id,
+                 "item_id": "out-" + item_id, "delta": "late duplicate"},
+                {"type": "response.done", "response": {"id": item_id}},
+            ):
+                client._handle_message(json.dumps(event))
+        finals = [event for event in events if event.is_final]
+        self.assertEqual(
+            [(event.source_text, event.translated_text) for event in finals],
+            [("First sentence.", "第一句。"), ("Second sentence.", "第二句。")],
+        )
+        self.assertFalse(any("duplicate" in event.translated_text for event in events))
+
+    def test_qwen38_first_audio_chunk_does_not_wait_for_final_text(self) -> None:
+        client, events, _, errors, playback = make_client(
+            model="qwen3.8-livetranslate-flash-realtime", audio_output=True,
+        )
+        pcm = b"\x00\x00\x01\x00"
+        client._handle_message(json.dumps({
+            "type": "response.audio_transcript.delta",
+            "response_id": "resp-1", "item_id": "out-1", "delta": "Hello",
+        }))
+        client._handle_message(json.dumps({
+            "type": "response.audio.delta",
+            "response_id": "resp-1",
+            "delta": base64.b64encode(pcm).decode("ascii"),
+        }))
+        self.assertEqual(errors, [])
+        self.assertEqual(playback.audio, [pcm])
+        self.assertTrue(events)
+        self.assertFalse(any(event.is_final for event in events))
+
     def test_text_translation_pairs_source_and_target(self) -> None:
         client, events, _, errors, _ = make_client(audio_output=False)
         client._handle_message(
@@ -852,6 +1293,8 @@ class ResponseParsingTests(unittest.TestCase):
 
         detail = diagnostics[-1].detail
         self.assertIn("event=alignment.finalized", detail)
+        self.assertIn("first_target=final_only", detail)
+        self.assertNotIn("first_target_ms=", detail)
         self.assertNotIn("private meeting content", detail)
         self.assertNotIn("confidential translation", detail)
 
